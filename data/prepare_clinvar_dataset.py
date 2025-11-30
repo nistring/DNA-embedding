@@ -50,17 +50,9 @@ def pos_in_gene(chrom2iv: Dict[str, List[Tuple[int, int]]], chrom: str, pos1: in
 def parse_clnsig(info_value) -> str:
     if info_value is None:
         return ""
-    if isinstance(info_value, (tuple, list)):
-        s = "|".join(map(str, info_value))
     else:
         s = str(info_value)
-    # Split into tokens; keep exact categories
-    toks = {t.strip().replace("_", " ").title() for t in s.replace("|", ",").split(",") if t}
-    if toks == {"Pathogenic"}:
-        return "pathogenic"
-    if toks == {"Benign"}:
-        return "benign"
-    return ""
+    return s
 
 def main():
     ap = argparse.ArgumentParser(description="Prepare ClinVar SNV dataset (compact) for contrastive training.")
@@ -92,35 +84,45 @@ def main():
         pos1 = rec.pos  # 1-based
         ref = rec.ref.upper()
         alts = rec.alts or ()
-        if not alts or len(ref) != 1 or ref not in DNA:
-            continue
         cl = parse_clnsig(rec.info.get("CLNSIG"))
-        if cl not in ("benign", "pathogenic"):
-            continue
-        if not pos_in_gene(gene_iv, chrom, pos1):
-            continue
+        # if not pos_in_gene(gene_iv, chrom, pos1):
+        #     continue
         for alt in alts:
             alt = (alt or "").upper()
-            if len(alt) != 1 or alt not in DNA:
-                continue
             if alt == ref:
+                print(f"Warning: alt == ref for {chrom}:{pos1} {ref}>{alt}")
                 continue
             # Build window [pos1-511, pos1+511] inclusive
             start1 = pos1 - (half - 1)
             end1 = pos1 + half
             # Boundaries check
             if start1 < 1:
+                print(f"Warning: start {start1} < 1 for {chrom}:{pos1}")
                 continue
             # fetch uses 0-based, half-open [start0, end0)
             start0 = start1 - 1
-            seq = fa.fetch(chrom, start0, end1)  # length should be window
+            try:
+                seq = fa.fetch(chrom, start0, end1)  # length should be window
+            except:
+                print(f"Warning: could not fetch {chrom}:{start1}-{end1}")
+                continue
             if len(seq) != args.window:
+                print(f"Warning: fetched sequence length {len(seq)} != window {args.window} for {chrom}:{start1}-{end1}")
                 continue
             seq = seq.upper()
             # sanity: reference base matches fasta at center
             if seq[mut_idx] != ref:
                 continue
-            label = 1 if cl == "pathogenic" else 0
+            if "Pathogenic" in cl:
+                label = 1
+            elif "Likely_pathogenic" in cl:
+                label = 1
+            elif "Benign" in cl:
+                label = 0
+            else:
+                # Remove: Uncertain, Likely Benign, Conflicting, Not Provided, Other
+                continue
+                
             writer.writerow([seq, mut_idx, alt, label])
             kept += 1
             seen += 1
@@ -130,6 +132,7 @@ def main():
     fa.close()
     # print minimal stats
     print(f"Wrote {kept} SNVs to {args.out}")
+
 
 if __name__ == "__main__":
     main()

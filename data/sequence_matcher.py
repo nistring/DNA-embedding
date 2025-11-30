@@ -20,6 +20,11 @@ def find_matching_sequences(test_file, bac_refs_file, clinvar_file, enable_progr
     bac_refs_sequences = set(bac_refs_df['seq'].dropna())
     clinvar_sequences = set(clinvar_df['ref_seq'].dropna())  # changed from clinvar_df['seq']
     
+    # Track variation types in clinvar if label column exists
+    clinvar_label_counts = {}
+    if 'label' in clinvar_df.columns:
+        clinvar_label_counts = clinvar_df['label'].value_counts().to_dict()
+    
     # Find matches
     results = []
     iterator = test_df.iterrows()
@@ -48,6 +53,12 @@ def find_matching_sequences(test_file, bac_refs_file, clinvar_file, enable_progr
     print(f"Matches in clinvar_compact.csv: {results_df['found_in_clinvar'].sum()}")
     print(f"Matches in both: {(results_df['found_in_bac_refs'] & results_df['found_in_clinvar']).sum()}")
     
+    # Print ClinVar variation type counts
+    if clinvar_label_counts:
+        print(f"\nClinVar variation type counts:")
+        print(f"  Pathogenic/Likely Pathogenic (label=1): {clinvar_label_counts.get(1, 0)}")
+        print(f"  Benign (label=0): {clinvar_label_counts.get(0, 0)}")
+                  
     # Prepare and write ClinVar with matched ref_seq removed
     matched_clinvar_sequences = {r['sequence'] for r in results if r['found_in_clinvar']}
     clinvar_removed_df = clinvar_df[~clinvar_df['ref_seq'].isin(matched_clinvar_sequences)]
@@ -55,6 +66,14 @@ def find_matching_sequences(test_file, bac_refs_file, clinvar_file, enable_progr
     rows_removed = len(clinvar_df) - len(clinvar_removed_df)
     distinct_clinvar_sequences_removed = clinvar_df[clinvar_df['ref_seq'].isin(matched_clinvar_sequences)]['ref_seq'].nunique()
     duplicate_removed_rows = rows_removed - distinct_clinvar_sequences_removed
+    
+    # Print ClinVar rows removed by category
+    removed_by_category = clinvar_df[clinvar_df['ref_seq'].isin(matched_clinvar_sequences)]['label'].value_counts().sort_index()
+    print(f"\nClinVar rows removed by category:")
+    if not removed_by_category.empty:
+        print(f"  Pathogenic/Likely Pathogenic (label=1): {removed_by_category.get(1, 0)}")
+        print(f"  Benign (label=0): {removed_by_category.get(0, 0)}")
+    
     print(f"ClinVar rows removed: {rows_removed}. Saved to clinvar_compact_removed.csv")
     print(f"Matched test sequences (rows in test with ClinVar hits): {results_df['found_in_clinvar'].sum()}")
     print(f"Unique matched test sequences set size: {len(matched_clinvar_sequences)}")

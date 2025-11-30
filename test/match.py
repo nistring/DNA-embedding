@@ -24,16 +24,32 @@ def nearest(args):
     return samples[i], samples[best_j], best_d
 
 if __name__ == "__main__":
-    df = pd.read_csv("test.csv", usecols=[0, 1], names=["ID", "seq"], header=0)
+    df = pd.read_csv("../data/test.csv", usecols=[0, 1], names=["ID", "seq"], header=0)
     samples, seqs = df["ID"].tolist(), df["seq"].tolist()
     gc_map = {s: gc_content(seq) for s, seq in zip(samples, seqs)}
 
-    tasks = [(i, seqs, samples) for i in range(len(seqs))]
-    with Pool(processes=48) as pool:
-        it = pool.imap_unordered(nearest, tasks, chunksize=64)
-        pairs = [p for p in tqdm(it, total=len(tasks), desc="Matching")]
+    # Compute distances for all unordered pairs (i < j) and keep those with d <= 512.
+    # This ensures dist_le_512 contains every pair whose hdist <= 512, not only nearest neighbors.
+    from itertools import combinations
 
-    # dedupe symmetric pairs, keep smallest distance on conflicts
+    def pair_hd(args):
+        i, j = args
+        d = hdist(seqs[i], seqs[j])
+        if d <= 512:
+            return samples[i], samples[j], d
+        return None
+
+    idx_iter = combinations(range(len(seqs)), 2)
+    total_pairs = len(seqs) * (len(seqs) - 1) // 2
+
+    pairs = []
+    with Pool(processes=48) as pool:
+        it = pool.imap_unordered(pair_hd, idx_iter, chunksize=64)
+        for res in tqdm(it, total=total_pairs, desc="Matching"):
+            if res is not None:
+                pairs.append(res)
+
+    # dedupe symmetric pairs, keep smallest distance on conflicts (pairs already have d <= 512)
     uniq = {}
     for a, b, d in pairs:
         x, y = (a, b) if a <= b else (b, a)
@@ -42,19 +58,24 @@ if __name__ == "__main__":
 
     dist1 = [(x, y, d, gc_map[x], gc_map[y]) for (x, y), d in uniq.items() if d == 1]
     dist2_512 = [(x, y, d, gc_map[x], gc_map[y]) for (x, y), d in uniq.items() if 2 <= d <= 512]
-    
+
+    # all unique unordered pairs with distance <= 512 (includes d==0 and d==1)
+    dist_le_512 = [(x, y, d, gc_map[x], gc_map[y]) for (x, y), d in uniq.items() if d <= 512]
+
     matched = set()
-    for (x, y), d in uniq.items():
-        if d <= 512:
-            matched.add(x)
-            matched.add(y)
+    for (x, y, d, _, _) in dist_le_512:
+        matched.add(x)
+        matched.add(y)
     unmatched = [(s, gc_map[s]) for s in samples if s not in matched]
 
     pd.DataFrame(dist1, columns=["sample_a", "sample_b", "distance", "gc_a", "gc_b"]).sort_values("sample_a").to_csv("match_dist1.csv", index=False)
     pd.DataFrame(dist2_512, columns=["sample_a", "sample_b", "distance", "gc_a", "gc_b"]).sort_values("sample_a").to_csv("match_dist2_512.csv", index=False)
+    pd.DataFrame(dist_le_512, columns=["sample_a", "sample_b", "distance", "gc_a", "gc_b"]).sort_values("sample_a").to_csv("match_le_512.csv", index=False)
+
     pd.DataFrame(unmatched, columns=["sample", "gc_content"]).to_csv("unmatched.csv", index=False)
 
     # Print GC statistics
+    print(f"Pairs with hdist <= 512: {len(dist_le_512)} (saved to match_le_512.csv)")
     if dist1:
         gc_a = [x[3] for x in dist1]
         gc_b = [x[4] for x in dist1]

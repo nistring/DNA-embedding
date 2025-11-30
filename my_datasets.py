@@ -4,19 +4,14 @@ import logging
 import random
 from typing import Dict, List
 import torch
-from torch.utils.data import Dataset, Sampler
+from torch.utils.data import Dataset
 import transformers
 
 logger = logging.getLogger(__name__)
 
 
-class ContrastiveClinVarDataset(Dataset):
-    """Contrastive learning dataset for ClinVar - returns (ref, snv) pairs.
-    
-    Labels: 0 = benign, 1 = pathogenic
-    SupConLoss will maximize distance between benign and pathogenic classes,
-    and also push ref and snv apart (they get same label but are different sequences).
-    """
+class ClinVarRefAltDataset(Dataset):
+    """ClinVar dataset for cd_loss - returns (ref, alt) pairs."""
     def __init__(self, path: str, tokenizer: transformers.PreTrainedTokenizer, sep: str = ","):
         super().__init__()
         with open(path, "r") as f:
@@ -24,24 +19,56 @@ class ContrastiveClinVarDataset(Dataset):
                            "alt": row["alt"].upper(), "label": int(row["label"])}
                           for row in csv.DictReader(f, delimiter=sep)]
         self.tokenizer = tokenizer
-        self.num_labels = 2
-        logger.info(f"Loaded {len(self.samples)} ClinVar samples")
+        logger.info(f"Loaded {len(self.samples)} ClinVar ref-alt pairs for cd_loss")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
         s = self.samples[idx]
-        ref_seq, mi, alt, label = s["ref"], s["mut_idx"], s["alt"], s["label"]
-        snv_seq = (ref_seq[:mi] + alt + ref_seq[mi+1:]) if (0 <= mi < len(ref_seq) and ref_seq[mi] != alt) else ref_seq
+        ref_seq, mi, alt = s["ref"], s["mut_idx"], s["alt"]
+        snv_seq = ref_seq[:mi] + alt + ref_seq[mi+1:]
 
         output = self.tokenizer([ref_seq, snv_seq], padding="max_length", 
                                max_length=self.tokenizer.model_max_length, 
                                truncation=True, return_tensors="pt")
 
-        return {"input_ids": output["input_ids"], "attention_mask": output["attention_mask"],
-                "labels": torch.tensor(label, dtype=torch.long),
-                "is_clinvar": torch.tensor(True, dtype=torch.bool)}
+        # We don't return attention_mask to save memory; model can run without it.
+        return {"input_ids": output["input_ids"], \
+            "labels": torch.tensor(0, dtype=torch.long), "batch_type": torch.tensor(0, dtype=torch.long)}
+
+
+class ClinVarPathogenicDataset(Dataset):
+    """ClinVar dataset for cdd_loss - returns benign and pathogenic mutation sequences."""
+    def __init__(self, path: str, tokenizer: transformers.PreTrainedTokenizer, sep: str = ","):
+        super().__init__()
+        with open(path, "r") as f:
+            samples = [{"ref": row["ref_seq"], "mut_idx": int(row["mut_idx"]), 
+                       "alt": row["alt"].upper(), "label": int(row["label"])}
+                      for row in csv.DictReader(f, delimiter=sep)]
+        # Group by label
+        self.benign = [s for s in samples if s["label"] == 0]
+        self.pathogenic = [s for s in samples if s["label"] == 1]
+        self.tokenizer = tokenizer
+        logger.info(f"Loaded {len(self.benign)} benign and {len(self.pathogenic)} pathogenic mutations for cdd_loss")
+
+    def __len__(self):
+        return max(len(self.benign), len(self.pathogenic))
+
+    def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
+        benign = self.benign[idx % len(self.benign)]
+        pathogenic = self.pathogenic[idx % len(self.pathogenic)]
+        
+        # Create mutation sequences
+        benign_seq = benign["ref"][:benign["mut_idx"]] + benign["alt"] + benign["ref"][benign["mut_idx"]+1:]
+        pathogenic_seq = pathogenic["ref"][:pathogenic["mut_idx"]] + pathogenic["alt"] + pathogenic["ref"][pathogenic["mut_idx"]+1:]
+        output = self.tokenizer([benign_seq, pathogenic_seq], padding="max_length", 
+                               max_length=self.tokenizer.model_max_length, 
+                               truncation=True, return_tensors="pt")
+
+        # Omit attention_mask to reduce batch memory footprint; keep labels and batch_type
+        return {"input_ids": output["input_ids"], \
+            "labels": torch.tensor([0, 1], dtype=torch.long), "batch_type": torch.tensor(1, dtype=torch.long)}
 
 
 class ContrastiveMutateDataset(Dataset):
@@ -52,14 +79,21 @@ class ContrastiveMutateDataset(Dataset):
     """
     DNA = ["A", "C", "G", "T"]
 
-    def __init__(self, path: str, tokenizer: transformers.PreTrainedTokenizer, seq_col: str = "seq", sep: str = ",", mut_levels=(2, 8, 64, 128, 256, 512)):
+    def __init__(self, path: str, tokenizer: transformers.PreTrainedTokenizer, seq_col: str = "seq", sep: str = ",", mut_levels=(1, 2, 8, 64, 128, 256, 512), use_reverse_complement: bool = False):
         super().__init__()
         with open(path, "r") as f:
             data = list(csv.reader(f, delimiter=sep))
         seq_idx = data[0].index(seq_col) if data else 0
         self.seqs = [row[seq_idx] for row in data[1:]]
+        
+        # Double dataset with reverse complement versions
+        if use_reverse_complement:
+            original_seqs = self.seqs.copy()
+            for seq in original_seqs:
+                self.seqs.append(self._reverse_complement(seq))
+        
         self.mut_levels, self.tokenizer = tuple(mut_levels), tokenizer
-        logger.info(f"Loaded {len(self.seqs)} mutation samples")
+        logger.info(f"Loaded {len(self.seqs)} mutation samples (reverse_complement={use_reverse_complement})")
 
     def __len__(self):
         return len(self.seqs)
@@ -71,84 +105,60 @@ class ContrastiveMutateDataset(Dataset):
             seq_list[i] = random.choice([b for b in ContrastiveMutateDataset.DNA if b != seq_list[i]])
         return "".join(seq_list)
 
+    @staticmethod
+    def _reverse_complement(seq: str) -> str:
+        """Compute reverse complement of DNA sequence."""
+        complement = {"A": "T", "T": "A", "G": "C", "C": "G"}
+        return "".join(complement.get(base, base) for base in reversed(seq))
+
     def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
         ref, k = self.seqs[idx], random.choice(self.mut_levels)
-        output = self.tokenizer([ref, self._mutate(ref, k)], padding="max_length",
+        mutated = self._mutate(ref, k)
+        
+        output = self.tokenizer([ref, mutated], padding="max_length",
                                max_length=self.tokenizer.model_max_length, 
                                truncation=True, return_tensors="pt")
-        return {"input_ids": output["input_ids"], "attention_mask": output["attention_mask"],
-                "labels": torch.log2(torch.tensor(k, dtype=torch.float32)),
-                "is_clinvar": torch.tensor(False, dtype=torch.bool)}
-
-
-class BatchGroupedSampler(Sampler):
-    """Sampler that groups indices into batches while maintaining order for alternating datasets.
-    
-    Ensures all samples in a minibatch come from the same dataset source while
-    preserving the strict alternating pattern between datasets.
-    """
-    def __init__(self, dataset_len: int, batch_size: int, shuffle: bool = True, seed: int = 42):
-        self.dataset_len = dataset_len
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.seed = seed
-        self.num_batches = (dataset_len + batch_size - 1) // batch_size
-
-    def __iter__(self):
-        batch_indices = list(range(self.num_batches))
-        if self.shuffle:
-            random.Random(self.seed).shuffle(batch_indices)
-        for batch_idx in batch_indices:
-            yield from range(batch_idx * self.batch_size, 
-                           min((batch_idx + 1) * self.batch_size, self.dataset_len))
-
-    def __len__(self):
-        return self.dataset_len
-
-    def set_epoch(self, epoch: int):
-        """Set epoch for proper shuffling in distributed training."""
-        self.seed = self.seed + epoch
+        # Only return input_ids, labels and batch_type to minimize memory usage
+        return {"input_ids": output["input_ids"], \
+            "labels": torch.log2(torch.tensor(k, dtype=torch.float32)), \
+            "batch_type": torch.tensor(2, dtype=torch.long)}
 
 
 class BalancedAlternatingDataset(Dataset):
-    """Interleaves items from two datasets in 1:1 ratio for balanced training.
+    """Interleaves items from three datasets in round-robin fashion for balanced training.
     
-    Alternates batches: batch 0 from dataset_a, batch 1 from dataset_b, etc.
-    Ensures each minibatch is homogeneous (all from one dataset) while keeping
-    training balanced across both datasets. Data within each dataset is shuffled.
-    
-    Use with BatchGroupedSampler for shuffled but homogeneous batches.
-    If len(dataset_b) < len(dataset_a), dataset_b is cycled.
+    Cycles through datasets sequentially by batch: dataset_a, dataset_b, dataset_c, repeat.
+    Each dataset is shuffled independently for proper randomization.
     """
-    def __init__(self, dataset_a: Dataset, dataset_b: Dataset, batch_size: int = 32, seed: int = 42):
-        self.dataset_a, self.dataset_b = dataset_a, dataset_b
-        self.batch_size, self.seed = batch_size, seed
+    def __init__(self, dataset_a: Dataset, dataset_b: Dataset, dataset_c: Dataset, batch_size: int = 32, seed: int = 42, shuffle: bool = True):
+        self.datasets = [dataset_a, dataset_b, dataset_c]
+        self.batch_size, self.seed, self.shuffle = batch_size, seed, shuffle
         
         rng = random.Random(seed)
-        self.indices_a, self.indices_b = list(range(len(dataset_a))), list(range(len(dataset_b)))
-        rng.shuffle(self.indices_a)
-        rng.shuffle(self.indices_b)
+        self.indices = [list(range(len(ds))) for ds in self.datasets]
+        for idx_list in self.indices:
+            rng.shuffle(idx_list)
         
-        num_batches = max((len(dataset_a) + batch_size - 1) // batch_size,
-                         (len(dataset_b) + batch_size - 1) // batch_size) * 2
+        num_batches = max((len(ds) + batch_size - 1) // batch_size for ds in self.datasets) * 3
         self.num_batches, self.length = num_batches, num_batches * batch_size
-        self.column_names = getattr(dataset_a, "column_names", ["input_ids", "attention_mask", "labels"])
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
         batch_num, idx_in_batch = divmod(idx, self.batch_size)
-        sample_idx = (batch_num // 2) * self.batch_size + idx_in_batch
-        if batch_num % 2 == 0:
-            return self.dataset_a[self.indices_a[sample_idx % len(self.dataset_a)]]
-        return self.dataset_b[self.indices_b[sample_idx % len(self.dataset_b)]]
+        dataset_idx = batch_num % 3
+        sample_idx = (batch_num // 3) * self.batch_size + idx_in_batch
+        return self.datasets[dataset_idx][self.indices[dataset_idx][sample_idx % len(self.datasets[dataset_idx])]]
     
     def set_epoch(self, epoch: int):
         """Reshuffle data at each epoch for proper randomization in distributed training."""
+        if not self.shuffle:
+            return
         rng = random.Random(self.seed + epoch)
-        self.indices_a, self.indices_b = list(range(len(self.dataset_a))), list(range(len(self.dataset_b)))
-        rng.shuffle(self.indices_a), rng.shuffle(self.indices_b)
+        self.indices = [list(range(len(ds))) for ds in self.datasets]
+        for idx_list in self.indices:
+            rng.shuffle(idx_list)
 
 
 class ContrastiveDataCollator:
@@ -158,21 +168,19 @@ class ContrastiveDataCollator:
     Converts (B, 2, seq_len) inputs to (B*2, seq_len) for model forward pass,
     while preserving metadata needed to reshape back in the loss function.
     """
-    def __init__(self, pad_token_id=0):
-        self.pad_token_id = pad_token_id
     
     def __call__(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         """Collate batch of samples, flattening the pair dimension."""
-        collated = {'_batch_size': len(batch)}
-        for key in batch[0].keys():
-            if key in ['input_ids', 'attention_mask']:
-                stacked = torch.stack([sample[key] for sample in batch])  # (B, 2, seq_len)
-                collated[key] = stacked.view(-1, stacked.shape[-1])  # (B*2, seq_len)
-            elif key in ['labels', 'is_clinvar']:
-                collated[key] = torch.stack([sample[key] for sample in batch])
-            else:
-                try:
-                    collated[key] = torch.stack([sample[key] for sample in batch])
-                except (ValueError, RuntimeError):
-                    collated[key] = [sample[key] for sample in batch]
+        collated = {}
+        # Stack and flatten input_ids (B, 2, seq_len) -> (B*2, seq_len)
+        stacked = torch.stack([sample['input_ids'] for sample in batch])
+        collated['input_ids'] = stacked.view(-1, stacked.shape[-1])
+
+        # Stack labels as-is (some labels are vectors, some scalars)
+        collated['labels'] = torch.stack([sample['labels'] for sample in batch])
+
+        # Pass batch_type as an integer (single scalar per batch)
+        # It is sufficient to inspect the first sample because batches are homogeneous in type.
+        bt_sample = batch[0]['batch_type']
+        collated['batch_type'] = int(bt_sample.item())
         return collated

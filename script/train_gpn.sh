@@ -16,7 +16,7 @@ NUM_GPUS=1
 MODEL_NAME="songlab/gpn-brassicales"
 TOKENIZER_NAME="gonzalobenegas/tokenizer-dna-mlm"
 DATA_PATH="./data"  # Update with your data directory
-RUN_NAME="gpn_finetune9"
+RUN_NAME="gpn_finetune_2datasets"
 OUTPUT_DIR="./output/${RUN_NAME}"
 
 # Training hyperparameters
@@ -24,13 +24,13 @@ MAX_LENGTH=1024
 BATCH_SIZE=160
 GRAD_ACCUM=1
 LEARNING_RATE=1e-4
-EPOCHS=5           # Standard for most tasks
+EPOCHS=3           # Standard for most tasks
 SEED=42
 
 # Training options
-WARMUP_STEPS=5     # Official standard
+WARMUP_STEPS=0     # Official standard
 EVAL_STEPS=50      # Official evaluation frequency
-LOGGING_STEPS=10 # Keep high to reduce logging overhead
+LOGGING_STEPS=50 # Keep high to reduce logging overhead
 EVAL_STRATEGY="epoch"  # Evaluate based on eval_steps
 LR_SCHEDULER_TYPE="linear"  # Custom inverse_sqrt scheduler with rapid decay
 

@@ -26,7 +26,7 @@ class ClinVarRefAltDataset(Dataset):
 
     def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
         s = self.samples[idx]
-        ref_seq, mi, alt = s["ref"], s["mut_idx"], s["alt"]
+        ref_seq, mi, alt, label = s["ref"], s["mut_idx"], s["alt"], s["label"]
         snv_seq = ref_seq[:mi] + alt + ref_seq[mi+1:]
 
         output = self.tokenizer([ref_seq, snv_seq], padding="max_length", 
@@ -35,7 +35,7 @@ class ClinVarRefAltDataset(Dataset):
 
         # We don't return attention_mask to save memory; model can run without it.
         return {"input_ids": output["input_ids"], \
-            "labels": torch.tensor(0, dtype=torch.long), "batch_type": torch.tensor(0, dtype=torch.long)}
+            "labels": torch.tensor(label, dtype=torch.float32), "batch_type": torch.tensor(0, dtype=torch.long)}
 
 
 class ClinVarPathogenicDataset(Dataset):
@@ -127,11 +127,11 @@ class ContrastiveMutateDataset(Dataset):
 class BalancedAlternatingDataset(Dataset):
     """Interleaves items from three datasets in round-robin fashion for balanced training.
     
-    Cycles through datasets sequentially by batch: dataset_a, dataset_b, dataset_c, repeat.
+    Cycles through datasets sequentially by batch: datasets repeat.
     Each dataset is shuffled independently for proper randomization.
     """
-    def __init__(self, dataset_a: Dataset, dataset_b: Dataset, dataset_c: Dataset, batch_size: int = 32, seed: int = 42, shuffle: bool = True):
-        self.datasets = [dataset_a, dataset_b, dataset_c]
+    def __init__(self, datasets: List[Dataset], batch_size: int = 32, seed: int = 42, shuffle: bool = True):
+        self.datasets = datasets
         self.batch_size, self.seed, self.shuffle = batch_size, seed, shuffle
         
         rng = random.Random(seed)
@@ -139,7 +139,7 @@ class BalancedAlternatingDataset(Dataset):
         for idx_list in self.indices:
             rng.shuffle(idx_list)
         
-        num_batches = max((len(ds) + batch_size - 1) // batch_size for ds in self.datasets) * 3
+        num_batches = max((len(ds) + batch_size - 1) // batch_size for ds in self.datasets) * len(self.datasets)
         self.num_batches, self.length = num_batches, num_batches * batch_size
 
     def __len__(self):
@@ -147,8 +147,8 @@ class BalancedAlternatingDataset(Dataset):
 
     def __getitem__(self, idx):
         batch_num, idx_in_batch = divmod(idx, self.batch_size)
-        dataset_idx = batch_num % 3
-        sample_idx = (batch_num // 3) * self.batch_size + idx_in_batch
+        dataset_idx = batch_num % len(self.datasets)
+        sample_idx = (batch_num // len(self.datasets)) * self.batch_size + idx_in_batch
         return self.datasets[dataset_idx][self.indices[dataset_idx][sample_idx % len(self.datasets[dataset_idx])]]
     
     def set_epoch(self, epoch: int):

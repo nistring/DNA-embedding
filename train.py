@@ -89,22 +89,22 @@ def main():
     logger.info(f"Loading datasets from {data_args.clinvar_csv} and {data_args.refs_csv}")
     # Create three separate datasets
     refalt_dataset = ClinVarRefAltDataset(data_args.clinvar_csv, tokenizer, data_args.clinvar_sep)
-    pathogenic_dataset = ClinVarPathogenicDataset(data_args.clinvar_csv, tokenizer, data_args.clinvar_sep)
+    # pathogenic_dataset = ClinVarPathogenicDataset(data_args.clinvar_csv, tokenizer, data_args.clinvar_sep)
     mutate_dataset = ContrastiveMutateDataset(data_args.refs_csv, tokenizer, "seq", data_args.refs_sep, use_reverse_complement=model_args.use_reverse_complement)
     
     # Split each dataset into train/eval
     train_idx, eval_idx = train_test_split(list(range(len(refalt_dataset))), test_size=0.05, random_state=42)
     refalt_train, refalt_eval = torch.utils.data.Subset(refalt_dataset, train_idx), torch.utils.data.Subset(refalt_dataset, eval_idx)
     
-    train_idx, eval_idx = train_test_split(list(range(len(pathogenic_dataset))), test_size=0.05, random_state=42)
-    pathogenic_train, pathogenic_eval = torch.utils.data.Subset(pathogenic_dataset, train_idx), torch.utils.data.Subset(pathogenic_dataset, eval_idx)
+    # train_idx, eval_idx = train_test_split(list(range(len(pathogenic_dataset))), test_size=0.05, random_state=42)
+    # pathogenic_train, pathogenic_eval = torch.utils.data.Subset(pathogenic_dataset, train_idx), torch.utils.data.Subset(pathogenic_dataset, eval_idx)
     
     train_idx, eval_idx = train_test_split(list(range(len(mutate_dataset))), test_size=0.05, random_state=42)
     mutate_train, mutate_eval = torch.utils.data.Subset(mutate_dataset, train_idx), torch.utils.data.Subset(mutate_dataset, eval_idx)
     
     # Combine three datasets with alternating batches
-    eval_dataset = BalancedAlternatingDataset(refalt_eval, pathogenic_eval, mutate_eval, training_args.per_device_eval_batch_size, 42, shuffle=False)
-    train_dataset = BalancedAlternatingDataset(refalt_train, pathogenic_train, mutate_train, training_args.per_device_train_batch_size, 42)
+    eval_dataset = BalancedAlternatingDataset([refalt_eval, mutate_eval], training_args.per_device_eval_batch_size, 42, shuffle=False)
+    train_dataset = BalancedAlternatingDataset([refalt_train, mutate_train], training_args.per_device_train_batch_size, 42)
 
     # Load pretrained model and wrap with projection head
     base_model = AutoModel.from_pretrained(

@@ -100,7 +100,7 @@ class ContrastiveTrainer(transformers.Trainer):
         outputs = model(**inputs)
 
         # Check if we should log this step
-        should_log = (self.state.global_step % self.args.logging_steps <= 2) if self.state.global_step > 0 else False
+        should_log = (self.state.global_step % self.args.logging_steps <= 1) if self.state.global_step > 0 else False
 
         loss = contrastive_loss_func(
             outputs, labels, batch_type,
@@ -147,7 +147,8 @@ def contrastive_loss_func(outputs, labels, batch_type, mutation_loss_weight=1.0,
     embeddings = torch.nn.functional.normalize(outputs[0].view(labels.shape[0], 2, -1), dim=-1)
 
     if batch_type == 0:  # cd_loss: ref-alt comparison
-        cd_loss = (embeddings[:, 0] * embeddings[:, 1]).sum(-1).mean()
+        labels = 2 * labels - 1  # Convert {0,1} to {-1,1}
+        cd_loss = ((embeddings[:, 0] * embeddings[:, 1]).sum(-1) * labels).mean()
         if should_log:
             logger.info(f"cd_loss: {cd_loss.item():.4f}")
         return clinvar_loss_weight * cd_loss

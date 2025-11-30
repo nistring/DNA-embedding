@@ -10,15 +10,16 @@ import gpn.model
 # Import projection wrapper
 from train import WithProjection
 
-MODEL_NAME="InstaDeepAI/nucleotide-transformer-v2-50m-multi-species"
-TOKENIZER_NAME="InstaDeepAI/nucleotide-transformer-v2-50m-multi-species"
-
+# MODEL_NAME="InstaDeepAI/nucleotide-transformer-v2-50m-multi-species"
+# TOKENIZER_NAME="InstaDeepAI/nucleotide-transformer-v2-50m-multi-species"
+MODEL_NAME="songlab/gpn-brassicales"
+TOKENIZER_NAME="gonzalobenegas/tokenizer-dna-mlm"
 def load_model(checkpoint_dir: str, device: torch.device):
     """Load fine-tuned DNABERT2 with projection head from checkpoint directory."""
     checkpoint_dir = os.path.abspath(checkpoint_dir)
     print(f"Loading fine-tuned model from {checkpoint_dir}")
     # Load base model and wrap with projection head
-    base_model = AutoModelForMaskedLM.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    base_model = AutoModel.from_pretrained(MODEL_NAME, trust_remote_code=True)
     model = WithProjection(base_model, input_dim=512, output_dim=2048)
     
     # Load safetensors weights from checkpoint
@@ -46,7 +47,7 @@ def main():
     parser.add_argument("--seq_col", type=str, default="seq")
     parser.add_argument("--output_csv", type=str)
     parser.add_argument("--checkpoint_dir", type=str, default="/home/work/.nistring/embedding/output/dnabert2_finetune/joint/checkpoint-813")
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=160)
     parser.add_argument("--max_length", type=int, default=1024)
     args = parser.parse_args()
 

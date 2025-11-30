@@ -162,7 +162,7 @@ class ContrastiveTrainer(transformers.Trainer):
         return (loss * 2, logits, labels)
 
 
-def supervised_contrastive_loss(projections, targets, temperature=0.07):
+def supervised_contrastive_loss(projections, targets, temperature=0.07, eps=1e-5):
     """
     Supervised Contrastive Loss based on:
     https://github.com/GuillaumeErhard/Supervised_contrastive_loss_pytorch/blob/main/loss/spc.py
@@ -173,24 +173,36 @@ def supervised_contrastive_loss(projections, targets, temperature=0.07):
     :param projections: torch.Tensor, shape [batch_size, projection_dim]
     :param targets: torch.Tensor, shape [batch_size]
     :param temperature: float, temperature scaling factor
+    :param eps: float, small value for numerical stability
     :return: torch.Tensor, scalar loss value
     """
     device = projections.device
     
     dot_product_tempered = torch.mm(projections, projections.T) / temperature
-    # Minus max for numerical stability with exponential. Same done in cross entropy. Epsilon added to avoid log(0)
+    # Minus max for numerical stability with exponential. Epsilon added to avoid log(0)
     exp_dot_tempered = (
-        torch.exp(dot_product_tempered - torch.max(dot_product_tempered, dim=1, keepdim=True)[0]) + 1e-5
+        torch.exp(dot_product_tempered - torch.max(dot_product_tempered, dim=1, keepdim=True)[0]) + eps
     )
     
-    mask_similar_class = (targets.unsqueeze(1).repeat(1, targets.shape[0]) == targets).to(device)
+    # Use broadcasting instead of repeat for efficiency
+    mask_similar_class = (targets.unsqueeze(1) == targets.unsqueeze(0)).to(device)
     mask_anchor_out = (1 - torch.eye(exp_dot_tempered.shape[0])).to(device)
     mask_combined = mask_similar_class * mask_anchor_out
     cardinality_per_samples = torch.sum(mask_combined, dim=1)
     
     log_prob = -torch.log(exp_dot_tempered / (torch.sum(exp_dot_tempered * mask_anchor_out, dim=1, keepdim=True)))
+    
+    # Handle division by zero when a sample has no other samples of the same class
+    # Replace zero cardinality with 1 to avoid division by zero, then mask out these samples
+    valid_samples = cardinality_per_samples > 0
+    cardinality_per_samples = torch.where(valid_samples, cardinality_per_samples, torch.ones_like(cardinality_per_samples))
     supervised_contrastive_loss_per_sample = torch.sum(log_prob * mask_combined, dim=1) / cardinality_per_samples
-    loss = torch.mean(supervised_contrastive_loss_per_sample)
+    
+    # Only average over samples with valid cardinality
+    if valid_samples.sum() > 0:
+        loss = torch.sum(supervised_contrastive_loss_per_sample * valid_samples) / valid_samples.sum()
+    else:
+        loss = torch.tensor(0.0, device=device)
     
     return loss
 

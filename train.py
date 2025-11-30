@@ -162,6 +162,39 @@ class ContrastiveTrainer(transformers.Trainer):
         return (loss * 2, logits, labels)
 
 
+def supervised_contrastive_loss(projections, targets, temperature=0.07):
+    """
+    Supervised Contrastive Loss based on:
+    https://github.com/GuillaumeErhard/Supervised_contrastive_loss_pytorch/blob/main/loss/spc.py
+    
+    Implementation of the loss described in the paper "Supervised Contrastive Learning":
+    https://arxiv.org/abs/2004.11362
+    
+    :param projections: torch.Tensor, shape [batch_size, projection_dim]
+    :param targets: torch.Tensor, shape [batch_size]
+    :param temperature: float, temperature scaling factor
+    :return: torch.Tensor, scalar loss value
+    """
+    device = projections.device
+    
+    dot_product_tempered = torch.mm(projections, projections.T) / temperature
+    # Minus max for numerical stability with exponential. Same done in cross entropy. Epsilon added to avoid log(0)
+    exp_dot_tempered = (
+        torch.exp(dot_product_tempered - torch.max(dot_product_tempered, dim=1, keepdim=True)[0]) + 1e-5
+    )
+    
+    mask_similar_class = (targets.unsqueeze(1).repeat(1, targets.shape[0]) == targets).to(device)
+    mask_anchor_out = (1 - torch.eye(exp_dot_tempered.shape[0])).to(device)
+    mask_combined = mask_similar_class * mask_anchor_out
+    cardinality_per_samples = torch.sum(mask_combined, dim=1)
+    
+    log_prob = -torch.log(exp_dot_tempered / (torch.sum(exp_dot_tempered * mask_anchor_out, dim=1, keepdim=True)))
+    supervised_contrastive_loss_per_sample = torch.sum(log_prob * mask_combined, dim=1) / cardinality_per_samples
+    loss = torch.mean(supervised_contrastive_loss_per_sample)
+    
+    return loss
+
+
 def contrastive_loss_func(outputs, labels, mutation_loss_weight=1.0, clinvar_loss_weight=1.0, alpha=0.5, num_items_in_batch=None, should_log=False, projection_head=None):
     """Custom loss function for supervised contrastive learning and mutation regression."""
     
@@ -169,12 +202,12 @@ def contrastive_loss_func(outputs, labels, mutation_loss_weight=1.0, clinvar_los
     embeddings = torch.nn.functional.normalize(outputs[0].view(labels.shape[0], 2, -1), dim=-1)
     
     if labels.max() <= 1:  # ClinVar: binary classification
-        labels = labels.unsqueeze(-1)  # (B, 1)
-        # mask = torch.eq(labels, 1 - labels.T).float().to(embeddings.device)
-        labels = (2 * labels - 1).float()  # Scale to {-1, 1}
-        mask = torch.eye(labels.shape[0], device=embeddings.device) - torch.matmul(labels, labels.T)  # (B, B), 1 if different class, -1 if same class
+        # cd_loss: push ref and alt apart
         cd_loss = (1 + (embeddings[:, 0] * embeddings[:, 1]).sum(-1).mean()) / 2  # Scale to [0,1]
-        cdd_loss = (1 + torch.nan_to_num((torch.matmul(embeddings[:, 1], embeddings[:, 1].T) * mask).sum() / mask.abs().sum())) / 2
+        
+        # cdd_loss: supervised contrastive loss on alt embeddings based on pathogenicity
+        cdd_loss = supervised_contrastive_loss(embeddings[:, 1], labels)
+        
         if should_log:
             logger.info(f"cd_loss: {cd_loss.item():.4f}, cdd_loss: {cdd_loss.item():.4f}")
         return clinvar_loss_weight * (cd_loss + cdd_loss)

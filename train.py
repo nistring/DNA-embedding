@@ -1,6 +1,3 @@
-"""DNABERT-2 fine-tuning with contrastive learning."""
-import os
-import json
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
@@ -9,58 +6,18 @@ import torch
 from sklearn.model_selection import train_test_split
 
 import transformers
-from transformers import AutoTokenizer, AutoModel, PreTrainedModel
-from peft import get_peft_model
+from transformers import AutoTokenizer, AutoModel, AutoModelForMaskedLM
+from peft import get_peft_model, LoraConfig, TaskType
 
 # Local imports
 from my_datasets import (
-    ContrastiveClinVarDataset,
+    ClinVarRefAltDataset,
+    ClinVarPathogenicDataset,
     ContrastiveMutateDataset,
     BalancedAlternatingDataset,
-    BatchGroupedSampler,
     ContrastiveDataCollator,
 )
-from utils import safe_save_model_for_hf_trainer
-
-
-class ProjectionHead(torch.nn.Module):
-    """Projection head combining SNV-specific token with multi-pooling sequence context."""
-    def __init__(self, input_dim=512, output_dim=2048):
-        super().__init__()
-        self.dense = torch.nn.Linear(input_dim * 4, output_dim)
-    
-    def forward(self, x):
-        # x: (B*2, seq_len, D)
-        snv_feat = x[:, 511]  # SNV-specific: (B*2, D)
-        mean_feat = x.mean(dim=1)  # Mean pooling: (B*2, D)
-        max_feat = x.max(dim=1)[0]  # Max pooling: (B*2, D)
-        min_feat = x.min(dim=1)[0]  # Min pooling: (B*2, D)
-        
-        # Concatenate: (B*2, 4*D) = (B*2, 2048)
-        combined = torch.cat([snv_feat, mean_feat, max_feat, min_feat], dim=-1)
-        return self.dense(combined)
-
-
-class DNABertWithProjection(torch.nn.Module):
-    """Wrapper model that adds projection head to pretrained DNABERT-2."""
-    
-    def __init__(self, base_model, input_dim=512, output_dim=2048):
-        super().__init__()
-        self.base_model = base_model
-        self.projection_head = ProjectionHead(input_dim, output_dim)
-        # Copy config from base model for compatibility
-        self.config = base_model.config
-    
-    def forward(self, *args, **kwargs):
-        """Forward pass through base model and projection head."""
-        outputs = self.base_model(*args, **kwargs)
-        # Extract last_hidden_state and apply projection
-        if hasattr(outputs, 'last_hidden_state'):
-            hidden_state = outputs.last_hidden_state
-        else:
-            hidden_state = outputs[0]
-        projected = self.projection_head(hidden_state)
-        return (projected,)
+from model import WithProjection, ContrastiveTrainer, contrastive_loss_func
 
 # Setup logging
 logging.basicConfig(
@@ -69,19 +26,21 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
 @dataclass
 class ModelArguments:
     model_name_or_path: str = field(default="zhihan1996/DNABERT-2-117M")
     tokenizer_name: Optional[str] = field(default=None)
-    model_type: str = field(default="DNABERT-2", metadata={"help": "Type of model to use"})
-    soft_masked_loss_weight_train: float = field(default=0.0, metadata={"help": "Weight for soft-masked loss during training"})
-    soft_masked_loss_weight_evaluation: float = field(default=0.0, metadata={"help": "Weight for soft-masked loss during evaluation"})
+    model_type: str = field(default="DNABERT-2", metadata={"help": "Type of model to use (e.g., 'DNABERT-2', 'GPN', 'nucleotide-transformer-v2')"})
     use_lora: bool = field(default=False, metadata={"help": "whether to use LoRA"})
     lora_r: int = field(default=8, metadata={"help": "hidden dimension for LoRA"})
-    lora_alpha: int = field(default=32, metadata={"help": "alpha for LoRA"})
+    lora_alpha: int = field(default=16, metadata={"help": "alpha for LoRA"})
     lora_dropout: float = field(default=0.05, metadata={"help": "dropout rate for LoRA"})
-    lora_target_modules: str = field(default="query,value,key,dense", metadata={"help": "where to perform LoRA"})
-
+    lora_target_modules: str = field(default="ffn.0", metadata={"help": "where to perform LoRA"})
+    use_reverse_complement: bool = field(default=False, metadata={"help": "Use reverse complement augmentation in training dataset"})
+    trust_remote_code: bool = field(default=True, metadata={"help": "Trust remote code for custom models"})
+    projection_output_dim: int = field(default=2048, metadata={"help": "Output dimension of projection head"})
 
 @dataclass
 class DataArguments:
@@ -96,96 +55,10 @@ class TrainingArguments(transformers.TrainingArguments):
     run_name: str = field(default="dnabert2_finetune")
     optim: str = field(default="adamw_torch")
     model_max_length: int = field(default=1024, metadata={"help": "Maximum sequence length"})
-    find_unused_parameters: bool = field(default=False)
     load_best_model_at_end: bool = field(default=True, metadata={"help": "Load best model at training end"})
     metric_for_best_model: str = field(default="eval_loss", metadata={"help": "Metric to use for best model selection"})
     greater_is_better: bool = field(default=False, metadata={"help": "Whether higher metric is better"})
-    lr_scheduler_type: str = field(default="exponential", metadata={"help": "Learning rate scheduler type"})
-    torch_compile: bool = field(default=False, metadata={"help": "Disable torch.compile to avoid dynamo tracing issues"})
-# -----------------------------
-# Contrastive Trainer
-# -----------------------------
-class ContrastiveTrainer(transformers.Trainer):
-    """Custom trainer for supervised contrastive learning and mutation regression."""
-    def __init__(self, mutation_loss_weight=1.0, clinvar_loss_weight=1.0, train_sampler=None, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.mutation_loss_weight = mutation_loss_weight
-        self.clinvar_loss_weight = clinvar_loss_weight
-        self.custom_train_sampler = train_sampler
-
-    def _get_train_sampler(self, *args, **kwargs):
-        """Return the custom batch-grouped sampler if available, otherwise use default."""
-        if self.custom_train_sampler is not None:
-            return self.custom_train_sampler
-        # Fall back to parent's implementation for default sampling
-        return super()._get_train_sampler(*args, **kwargs)
-
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """Compute custom contrastive loss for both training and evaluation."""
-        labels = inputs.pop("labels")
-        outputs = model(**inputs)
-        
-        # Check if we should log this step
-        should_log = (self.state.global_step % self.args.logging_steps == 0) if self.state.global_step > 0 else False
-        
-        loss = contrastive_loss_func(
-            outputs, labels, 
-            self.mutation_loss_weight, self.clinvar_loss_weight,
-            should_log=should_log)
-
-        return (loss, outputs) if return_outputs else loss
-
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        """
-        Perform a prediction step using custom contrastive loss for both training and evaluation.
-        Overrides parent's prediction_step to use our custom loss function.
-        """
-        inputs = self._prepare_inputs(inputs)
-        labels = inputs.pop("labels")
-        
-        with torch.no_grad():
-            outputs = model(**inputs)
-        
-        loss = contrastive_loss_func(
-            outputs, labels,
-            self.mutation_loss_weight, self.clinvar_loss_weight,
-            should_log=False
-        )
-        
-        if prediction_loss_only:
-            return (loss, None, None)
-        
-        logits = outputs.get("last_hidden_state") if isinstance(outputs, dict) else (
-            outputs[0] if isinstance(outputs, (tuple, list)) else outputs
-        )
-        
-        return (loss * 2, logits, labels)
-
-
-def contrastive_loss_func(outputs, labels, mutation_loss_weight=1.0, clinvar_loss_weight=1.0, alpha=0.5, num_items_in_batch=None, should_log=False, projection_head=None):
-    """Custom loss function for supervised contrastive learning and mutation regression."""
-    
-    # Embeddings are already projected by the model forward pass: (B*2, D')
-    embeddings = torch.nn.functional.normalize(outputs[0].view(labels.shape[0], 2, -1), dim=-1)
-    
-    if labels.max() <= 1:  # ClinVar: binary classification
-        labels = labels.unsqueeze(-1)  # (B, 1)
-        # mask = torch.eq(labels, 1 - labels.T).float().to(embeddings.device)
-        labels = (2 * labels - 1).float()  # Scale to {-1, 1}
-        mask = torch.eye(labels.shape[0], device=embeddings.device) - torch.matmul(labels, labels.T)  # (B, B), 1 if different class, -1 if same class
-        cd_loss = (1 + (embeddings[:, 0] * embeddings[:, 1]).sum(-1).mean()) / 2  # Scale to [0,1]
-        cdd_loss = (1 + torch.nan_to_num((torch.matmul(embeddings[:, 1], embeddings[:, 1].T) * mask).sum() / mask.abs().sum())) / 2
-        if should_log:
-            logger.info(f"cd_loss: {cd_loss.item():.4f}, cdd_loss: {cdd_loss.item():.4f}")
-        return clinvar_loss_weight * (cd_loss + cdd_loss)
-    else:  # Mutation: regression
-        cos_sim = (1 - (embeddings[:, 0] * embeddings[:, 1]).sum(-1)) / 2  # Scale to [0,1]
-        labels = labels / 10
-        pcc_loss = (mutation_loss_weight - alpha) * torch.nn.functional.mse_loss(cos_sim, labels) + \
-            alpha * (1 - torch.nan_to_num(torch.corrcoef(torch.stack([cos_sim, labels]))[0,1])) / 2
-        if should_log:
-            logger.info(f"pcc_loss: {pcc_loss.item():.4f}")
-        return pcc_loss
+    pcc_loss_alpha: float = field(default=0.5, metadata={"help": "Alpha parameter for PCC loss weighting (correlation vs MSE)"})
 
 def main():
     """Main training function for contrastive learning."""
@@ -199,6 +72,7 @@ def main():
         level=logging.INFO if training_args.local_rank in [-1, 0] else logging.WARNING, 
     )
     logger.info(f"Training/evaluation parameters {training_args}")
+    logger.info(f"Model type: {model_args.model_type}")
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
@@ -206,34 +80,64 @@ def main():
         cache_dir=training_args.cache_dir,
         model_max_length=training_args.model_max_length,
         padding_side="right",
-        use_fast=True,
-        trust_remote_code=True,
+        trust_remote_code=model_args.trust_remote_code,
     )
 
     if not (data_args.clinvar_csv and getattr(data_args, "refs_csv", None)):
         raise ValueError("Both --clinvar_csv and --refs_csv must be provided for joint training.")
     
     logger.info(f"Loading datasets from {data_args.clinvar_csv} and {data_args.refs_csv}")
-    clinvar_dataset = ContrastiveClinVarDataset(data_args.clinvar_csv, tokenizer, data_args.clinvar_sep)
-    mutate_dataset = ContrastiveMutateDataset(data_args.refs_csv, tokenizer, "seq", data_args.refs_sep)
+    # Create three separate datasets
+    refalt_dataset = ClinVarRefAltDataset(data_args.clinvar_csv, tokenizer, data_args.clinvar_sep)
+    pathogenic_dataset = ClinVarPathogenicDataset(data_args.clinvar_csv, tokenizer, data_args.clinvar_sep)
+    mutate_dataset = ContrastiveMutateDataset(data_args.refs_csv, tokenizer, "seq", data_args.refs_sep, use_reverse_complement=model_args.use_reverse_complement)
     
-    train_idx, eval_idx = train_test_split(list(range(len(clinvar_dataset))), test_size=0.2, random_state=42)
-    clinvar_train, clinvar_eval = torch.utils.data.Subset(clinvar_dataset, train_idx), torch.utils.data.Subset(clinvar_dataset, eval_idx)
+    # Split each dataset into train/eval
+    train_idx, eval_idx = train_test_split(list(range(len(refalt_dataset))), test_size=0.05, random_state=42)
+    refalt_train, refalt_eval = torch.utils.data.Subset(refalt_dataset, train_idx), torch.utils.data.Subset(refalt_dataset, eval_idx)
     
-    eval_dataset = BalancedAlternatingDataset(clinvar_eval, mutate_dataset, training_args.per_device_eval_batch_size, 42 )
-    train_dataset = BalancedAlternatingDataset(clinvar_train, mutate_dataset, training_args.per_device_train_batch_size, 42)
+    train_idx, eval_idx = train_test_split(list(range(len(pathogenic_dataset))), test_size=0.05, random_state=42)
+    pathogenic_train, pathogenic_eval = torch.utils.data.Subset(pathogenic_dataset, train_idx), torch.utils.data.Subset(pathogenic_dataset, eval_idx)
+    
+    train_idx, eval_idx = train_test_split(list(range(len(mutate_dataset))), test_size=0.05, random_state=42)
+    mutate_train, mutate_eval = torch.utils.data.Subset(mutate_dataset, train_idx), torch.utils.data.Subset(mutate_dataset, eval_idx)
+    
+    # Combine three datasets with alternating batches
+    eval_dataset = BalancedAlternatingDataset(refalt_eval, pathogenic_eval, mutate_eval, training_args.per_device_eval_batch_size, 42, shuffle=False)
+    train_dataset = BalancedAlternatingDataset(refalt_train, pathogenic_train, mutate_train, training_args.per_device_train_batch_size, 42)
 
     # Load pretrained model and wrap with projection head
     base_model = AutoModel.from_pretrained(
         model_args.model_name_or_path,
-        trust_remote_code=True,
+        trust_remote_code=model_args.trust_remote_code,
     )
-    model = DNABertWithProjection(base_model, input_dim=512, output_dim=2048)
+
+    # Apply LoRA if enabled
+    if model_args.use_lora:
+        peft_config = LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            r=model_args.lora_r,
+            lora_alpha=model_args.lora_alpha,
+            lora_dropout=model_args.lora_dropout,
+            target_modules=model_args.lora_target_modules.split(","),
+            bias="none",
+        )
+        base_model = get_peft_model(base_model, peft_config)
+        logger.info("LoRA enabled")
+
+    # Create model with projection head
+    model = WithProjection(
+        base_model, 
+        input_dim=None,  # Auto-detect from config
+        output_dim=model_args.projection_output_dim,
+        model_type=model_args.model_type
+    )
+
+    logger.info(f"Model hidden dimension: {base_model.config.hidden_size if hasattr(base_model.config, 'hidden_size') else 'unknown'}")
     
     trainer = ContrastiveTrainer(
-        mutation_loss_weight=1.0, clinvar_loss_weight=1.0,
+        mutation_loss_weight=1.0, clinvar_loss_weight=1.0, pcc_loss_alpha=training_args.pcc_loss_alpha,
         model=model, args=training_args, train_dataset=train_dataset, eval_dataset=eval_dataset,
-        train_sampler=BatchGroupedSampler(len(train_dataset), training_args.per_device_train_batch_size, False, 42),
         data_collator=ContrastiveDataCollator())
 
     logger.info("Starting training")
@@ -241,4 +145,6 @@ def main():
 
 if __name__ == "__main__":
     import gpn.model
+    import os
+    os.environ["WANDB_DISABLED"] = "true"
     main()

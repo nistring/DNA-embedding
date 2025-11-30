@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ========================================
-# GPN Distributed Training Script
+# Nucleotide Transformer v2 500m Distributed Training Script
 # ========================================
 
 # Configuration
@@ -13,37 +13,39 @@ export OMP_NUM_THREADS=1
 NUM_GPUS=1
 
 # Model and data paths
-MODEL_NAME="songlab/gpn-brassicales"
-TOKENIZER_NAME="gonzalobenegas/tokenizer-dna-mlm"
+MODEL_NAME="InstaDeepAI/nucleotide-transformer-v2-50m-multi-species"
 DATA_PATH="./data"  # Update with your data directory
-RUN_NAME="gpn_finetune9"
+RUN_NAME="nucleotide_transformer_v2_finetune_50m"
 OUTPUT_DIR="./output/${RUN_NAME}"
 
-# Training hyperparameters
-MAX_LENGTH=1024
-BATCH_SIZE=160
-GRAD_ACCUM=1
+# Training hyperparameters based on model specs
+# NT-v2 500m: max_length=2048, trained with 1M token effective batch size
+MAX_LENGTH=175
+BATCH_SIZE=256  # Reduced for multi-GPU memory efficiency
+GRAD_ACCUM=1   # Gradient accumulation to simulate larger effective batch
 LEARNING_RATE=1e-4
-EPOCHS=5           # Standard for most tasks
+EPOCHS=5
 SEED=42
 
 # Training options
-WARMUP_STEPS=5     # Official standard
-EVAL_STEPS=50      # Official evaluation frequency
-LOGGING_STEPS=10 # Keep high to reduce logging overhead
+# Based on pretraining: linear warmup over 16k steps, square root decay
+WARMUP_STEPS=0    # Adjusted for downstream task
+EVAL_STEPS=100      # Evaluation frequency
+LOGGING_STEPS=50    # Logging frequency
 EVAL_STRATEGY="epoch"  # Evaluate based on eval_steps
-LR_SCHEDULER_TYPE="linear"  # Custom inverse_sqrt scheduler with rapid decay
+LR_SCHEDULER_TYPE="linear"  # Alternative: sqrt decay for better stability
 
-echo "Starting ${RUN_NAME} distributed training with joint ClinVar + mutation datasets..."
-echo "Settings: LR=${LEARNING_RATE}, Batch=${BATCH_SIZE}, GradAccum=${GRAD_ACCUM}, Epochs=${EPOCHS}, Scheduler=${LR_SCHEDULER_TYPE}, Warmup=${WARMUP_STEPS}"
+echo "Starting ${RUN_NAME} distributed training with Nucleotide Transformer v2 500m..."
+echo "Settings: LR=${LEARNING_RATE}, Batch=${BATCH_SIZE}, GradAccum=${GRAD_ACCUM}, MaxLen=${MAX_LENGTH}"
+echo "Epochs=${EPOCHS}, Scheduler=${LR_SCHEDULER_TYPE}, Warmup=${WARMUP_STEPS}"
 mkdir -p ${OUTPUT_DIR}
+
 torchrun --nproc_per_node=${NUM_GPUS} train.py \
     --model_name_or_path ${MODEL_NAME} \
-    --tokenizer_name ${TOKENIZER_NAME} \
-    --weight_decay 0.01 \
-    --model_type GPN \
-    --use_reverse_complement \
+    --model_type "nucleotide-transformer-v2" \
+    --use_reverse_complement True \
     --pcc_loss_alpha 1 \
+    --bf16 --bf16_full_eval \
     --clinvar_csv ${DATA_PATH}/clinvar_compact_removed.csv \
     --clinvar_sep "," \
     --refs_csv ${DATA_PATH}/bac_refs.csv \
@@ -59,21 +61,22 @@ torchrun --nproc_per_node=${NUM_GPUS} train.py \
     --max_grad_norm 1.0 \
     --save_strategy ${EVAL_STRATEGY} \
     --eval_strategy ${EVAL_STRATEGY} \
+    --eval_steps ${EVAL_STEPS} \
+    --save_steps ${EVAL_STEPS} \
     --do_train True \
     --do_eval True \
     --logging_steps ${LOGGING_STEPS} \
     --lr_scheduler_type ${LR_SCHEDULER_TYPE} \
+    --warmup_steps ${WARMUP_STEPS} \
     --overwrite_output_dir True \
     --log_level info \
     --seed ${SEED} \
-    --ddp_find_unused_parameters False \
+    --find_unused_parameters False \
     --dataloader_num_workers 48 \
-    --dataloader_pin_memory False \
+    --dataloader_pin_memory True \
     --remove_unused_columns False \
-    --use_reverse_complement True \
-    --bf16 --bf16_full_eval \
-    # --fp16 \
+    --weight_decay 0.01
     # > "${OUTPUT_DIR}/training.log" 2>&1 &
 
-    #--soft_masked_loss_weight_train 0.1 --soft_masked_loss_weight_evaluation 0.0 \
-echo "Training complete! Model saved to ${OUTPUT_DIR}/joint"
+echo "Training started! Monitor progress at ${OUTPUT_DIR}/training.log"
+echo "Model will be saved to ${OUTPUT_DIR}/joint"

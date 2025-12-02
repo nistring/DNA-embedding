@@ -27,16 +27,9 @@ class ProjectionHead(torch.nn.Module):
         # x: (B*2, seq_len, D)
         snv_pos = 511
 
-        # 1. Local Context (Motif Signal)
         snv_feat = x[:, snv_pos, :]
-        local_feat = x[:, snv_pos-2:snv_pos+3, :]  # 5-token window around SNV
-        # Apply conv1d
-        local_feat = self.conv(local_feat.permute(0, 2, 1)).squeeze(-1)
-    
-        # 2. Global Mean (Background Signal)
+        local_feat = self.conv(x[:, snv_pos-2:snv_pos+3, :].permute(0, 2, 1)).squeeze(-1)
         mean_feat = x.mean(dim=1)  
-
-        # 3. Global Max (Feature Presence)
         max_feat = x.max(dim=1)[0]  
         
         # Concatenate: (B, D + D + D + D) = (B, 4*D)
@@ -82,6 +75,8 @@ class ContrastiveTrainer(transformers.Trainer):
         self.clinvar_loss_weight = clinvar_loss_weight
         self.pcc_loss_alpha = pcc_loss_alpha
         self.num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        self.cos_loss = torch.nn.CosineEmbeddingLoss(-0.8)
+        self.triplet_loss = torch.nn.TripletMarginWithDistanceLoss(margin=1.5, distance_function=lambda x, y: 1 - torch.cosine_similarity(x, y))
 
     def _get_train_sampler(self, train_dataset=None):
         """Use SequentialSampler for monotonously increasing indices."""
@@ -100,9 +95,9 @@ class ContrastiveTrainer(transformers.Trainer):
         outputs = model(**inputs)
 
         # Check if we should log this step
-        should_log = (self.state.global_step % self.args.logging_steps <= 1) if self.state.global_step > 0 else False
+        should_log = self.state.global_step % self.args.logging_steps <= 1
 
-        loss = contrastive_loss_func(
+        loss = self.contrastive_loss_func(
             outputs, labels, batch_type,
             self.mutation_loss_weight, self.clinvar_loss_weight,
             alpha=self.pcc_loss_alpha,
@@ -122,7 +117,7 @@ class ContrastiveTrainer(transformers.Trainer):
         with torch.no_grad():
             outputs = model(**inputs)
         
-        loss = contrastive_loss_func(
+        loss = self.contrastive_loss_func(
             outputs, labels, batch_type,
             self.mutation_loss_weight, self.clinvar_loss_weight,
             alpha=self.pcc_loss_alpha,
@@ -139,56 +134,57 @@ class ContrastiveTrainer(transformers.Trainer):
         return (loss, logits, labels)
 
 
-def contrastive_loss_func(outputs, labels, batch_type, mutation_loss_weight=1.0, clinvar_loss_weight=1.0, alpha=0.5, num_items_in_batch=None, should_log=False):
-    """Custom loss function for supervised contrastive learning and mutation regression.
-    
-    batch_type: 0=cd_loss (ref-alt), 1=cdd_loss (benign-pathogenic), 2=pcc_loss (mutation)
-    """
-    embeddings = torch.nn.functional.normalize(outputs[0].view(labels.shape[0], 2, -1), dim=-1)
-
-    if batch_type == 0:  # cd_loss: ref-alt comparison
-        labels = 2 * labels - 1  # Convert {0,1} to {-1,1}
-        cd_loss = ((embeddings[:, 0] * embeddings[:, 1]).sum(-1) * labels).mean()
-        if should_log:
-            logger.info(f"cd_loss: {cd_loss.item():.4f}")
-        return clinvar_loss_weight * cd_loss
-    
-    elif batch_type == 1:  # cdd_loss: benign-pathogenic comparison
-        cdd_loss = (torch.matmul(embeddings[:, 0], embeddings[:, 1].T) \
-            - torch.matmul(embeddings[:, 0], embeddings[:, 0].T) \
-            - torch.matmul(embeddings[:, 1], embeddings[:, 1].T)).mean()
-        if should_log:
-            logger.info(f"cdd_loss: {cdd_loss.item():.4f}")
-        return clinvar_loss_weight * cdd_loss
+    def contrastive_loss_func(self, embeddings, labels, batch_type, mutation_loss_weight=1.0, clinvar_loss_weight=1.0, alpha=0.5, should_log=False):
+        """Custom loss function for supervised contrastive learning and mutation regression.
         
-        # https://github.com/GuillaumeErhard/Supervised_contrastive_loss_pytorch/blob/main/loss/spc.py
-        # temperature = 0.07
-        # projections = embeddings.view(embeddings.shape[0]*2, -1)  # (B*2, D)
-        # targets = labels.view(-1)  # (B*2,)
-        # dot_product_tempered = torch.mm(projections, projections.T) / temperature
-        # # Minus max for numerical stability with exponential. Same done in cross entropy. Epsilon added to avoid log(0)
-        # exp_dot_tempered = (
-        #     torch.exp(dot_product_tempered - torch.max(dot_product_tempered, dim=1, keepdim=True)[0]) + 1e-5
-        # )
+        batch_type: 0=cd_loss (ref-alt), 1=cdd_loss (benign-pathogenic), 2=pcc_loss (mutation)
+        """
+        embeddings = embeddings[0].view(labels.shape[0], 3 if batch_type == 1 else 2, -1)
 
-        # mask_similar_class = targets.unsqueeze(1).repeat(1, targets.shape[0]) == targets
-        # mask_anchor_out = (1 - torch.eye(exp_dot_tempered.shape[0])).to(embeddings.device)
-        # mask_combined = mask_similar_class * mask_anchor_out
-        # cardinality_per_samples = torch.sum(mask_combined, dim=1)
+        if batch_type == 0:  # cd_loss: ref-alt comparison
+            loss = self.cos_loss(embeddings[:, 0], embeddings[:, 1], labels)
+            if should_log:
+                logger.info(f"cos_loss: {loss.item():.4f}")
+            return clinvar_loss_weight * loss
+        
+        elif batch_type == 1:  # cdd_loss: benign-pathogenic comparison
+            triplet_loss = self.triplet_loss(
+                embeddings[:, 0],  # anchor: ref
+                embeddings[:, 1],  # positive: benign
+                embeddings[:, 2]   # negative: pathogenic
+            )
+            if should_log:
+                logger.info(f"triplet_loss: {triplet_loss.item():.4f}")
+            return clinvar_loss_weight * triplet_loss
+            
+            # https://github.com/GuillaumeErhard/Supervised_contrastive_loss_pytorch/blob/main/loss/spc.py
+            # temperature = 0.07
+            # projections = embeddings.view(embeddings.shape[0]*2, -1)  # (B*2, D)
+            # targets = labels.view(-1)  # (B*2,)
+            # dot_product_tempered = torch.mm(projections, projections.T) / temperature
+            # # Minus max for numerical stability with exponential. Same done in cross entropy. Epsilon added to avoid log(0)
+            # exp_dot_tempered = (
+            #     torch.exp(dot_product_tempered - torch.max(dot_product_tempered, dim=1, keepdim=True)[0]) + 1e-5
+            # )
 
-        # log_prob = -torch.log(exp_dot_tempered / (torch.sum(exp_dot_tempered * mask_anchor_out, dim=1, keepdim=True)))
-        # supervised_contrastive_loss_per_sample = torch.sum(log_prob * mask_combined, dim=1) / cardinality_per_samples
-        # supervised_contrastive_loss = torch.mean(supervised_contrastive_loss_per_sample)
-        # if should_log:
-        #     logger.info(f"cdd_loss: {supervised_contrastive_loss.item():.4f}")
-        # return supervised_contrastive_loss
+            # mask_similar_class = targets.unsqueeze(1).repeat(1, targets.shape[0]) == targets
+            # mask_anchor_out = (1 - torch.eye(exp_dot_tempered.shape[0])).to(embeddings.device)
+            # mask_combined = mask_similar_class * mask_anchor_out
+            # cardinality_per_samples = torch.sum(mask_combined, dim=1)
+
+            # log_prob = -torch.log(exp_dot_tempered / (torch.sum(exp_dot_tempered * mask_anchor_out, dim=1, keepdim=True)))
+            # supervised_contrastive_loss_per_sample = torch.sum(log_prob * mask_combined, dim=1) / cardinality_per_samples
+            # supervised_contrastive_loss = torch.mean(supervised_contrastive_loss_per_sample)
+            # if should_log:
+            #     logger.info(f"cdd_loss: {supervised_contrastive_loss.item():.4f}")
+            # return supervised_contrastive_loss
 
 
-    else:  # bt == 2: pcc_loss for mutation regression
-        cos_sim = (1 - (embeddings[:, 0] * embeddings[:, 1]).sum(-1)) / 2
-        labels = labels / 10
-        pcc_loss = (1 - alpha) * torch.nn.functional.mse_loss(cos_sim, labels) + \
-            alpha * (1 - torch.nan_to_num(torch.corrcoef(torch.stack([cos_sim, labels]))[0,1])) / 2
-        if should_log:
-            logger.info(f"pcc_loss: {pcc_loss.item():.4f}")
-        return mutation_loss_weight * pcc_loss
+        else:  # bt == 2: pcc_loss for mutation regression
+            cos_sim = (1 - torch.cosine_similarity(embeddings[:, 0], embeddings[:, 1], dim=-1)) / 2
+            labels = labels / 10
+            pcc_loss = (1 - alpha) * torch.nn.functional.mse_loss(cos_sim, labels) + \
+                alpha * (1 - torch.nan_to_num(torch.corrcoef(torch.stack([cos_sim, labels]))[0,1])) / 2
+            if should_log:
+                logger.info(f"pcc_loss: {pcc_loss.item():.4f}")
+            return mutation_loss_weight * pcc_loss

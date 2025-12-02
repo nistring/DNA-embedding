@@ -12,12 +12,12 @@ from peft import get_peft_model, LoraConfig, TaskType
 # Local imports
 from my_datasets import (
     ClinVarRefAltDataset,
-    ClinVarPathogenicDataset,
+    ClinVarTripletDataset,
     ContrastiveMutateDataset,
     BalancedAlternatingDataset,
     ContrastiveDataCollator,
 )
-from model import WithProjection, ContrastiveTrainer, contrastive_loss_func
+from model import WithProjection, ContrastiveTrainer
 
 # Setup logging
 logging.basicConfig(
@@ -45,6 +45,7 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     clinvar_csv: str = field(metadata={"help": "Path to ClinVar CSV with ref_seq,snv_seq,label"})
+    triplet_csv: str = field(metadata={"help": "Path to ClinVar triplet CSV with ref_seq,alt_pos,alt_neg"})
     refs_csv: str = field(metadata={"help": "Path to mutation CSV with reference sequences"})
     clinvar_sep: str = field(default=",")
     refs_sep: str = field(default=",")
@@ -82,19 +83,23 @@ def main():
         padding_side="right",
         trust_remote_code=model_args.trust_remote_code,
     )
-
-    if not (data_args.clinvar_csv and getattr(data_args, "refs_csv", None)):
-        raise ValueError("Both --clinvar_csv and --refs_csv must be provided for joint training.")
     
-    logger.info(f"Loading datasets from {data_args.clinvar_csv} and {data_args.refs_csv}")
+    logger.info(f"Loading datasets from {data_args.clinvar_csv}, {data_args.triplet_csv} and {data_args.refs_csv}")
     # Create three separate datasets
-    refalt_dataset = ClinVarRefAltDataset(data_args.clinvar_csv, tokenizer, data_args.clinvar_sep)
-    # pathogenic_dataset = ClinVarPathogenicDataset(data_args.clinvar_csv, tokenizer, data_args.clinvar_sep)
+    refpos_dataset = ClinVarRefAltDataset(data_args.clinvar_csv, tokenizer, data_args.clinvar_sep, 1)
+    refneg_dataset = ClinVarRefAltDataset(data_args.clinvar_csv, tokenizer, data_args.clinvar_sep, -1)
+    # pathogenic_dataset = ClinVarTripletDataset(data_args.triplet_csv, tokenizer, data_args.clinvar_sep)
     mutate_dataset = ContrastiveMutateDataset(data_args.refs_csv, tokenizer, "seq", data_args.refs_sep, use_reverse_complement=model_args.use_reverse_complement)
     
     # Split each dataset into train/eval
-    train_idx, eval_idx = train_test_split(list(range(len(refalt_dataset))), test_size=0.05, random_state=42)
-    refalt_train, refalt_eval = torch.utils.data.Subset(refalt_dataset, train_idx), torch.utils.data.Subset(refalt_dataset, eval_idx)
+    train_idx, eval_idx = train_test_split(list(range(len(refpos_dataset))), test_size=0.05, random_state=42)
+    refpos_train, refpos_eval = torch.utils.data.Subset(refpos_dataset, train_idx), torch.utils.data.Subset(refpos_dataset, eval_idx)
+    
+    train_idx, eval_idx = train_test_split(list(range(len(refneg_dataset))), test_size=0.05, random_state=42)
+    refneg_train, refneg_eval = torch.utils.data.Subset(refneg_dataset, train_idx), torch.utils.data.Subset(refneg_dataset, eval_idx)
+    
+    refalt_train = BalancedAlternatingDataset([refpos_train, refneg_train], training_args.per_device_train_batch_size, 42)
+    refalt_eval = BalancedAlternatingDataset([refpos_eval, refneg_eval], training_args.per_device_eval_batch_size, 42, shuffle=False)
     
     # train_idx, eval_idx = train_test_split(list(range(len(pathogenic_dataset))), test_size=0.05, random_state=42)
     # pathogenic_train, pathogenic_eval = torch.utils.data.Subset(pathogenic_dataset, train_idx), torch.utils.data.Subset(pathogenic_dataset, eval_idx)
@@ -103,8 +108,8 @@ def main():
     mutate_train, mutate_eval = torch.utils.data.Subset(mutate_dataset, train_idx), torch.utils.data.Subset(mutate_dataset, eval_idx)
     
     # Combine three datasets with alternating batches
-    eval_dataset = BalancedAlternatingDataset([refalt_eval, mutate_eval], training_args.per_device_eval_batch_size, 42, shuffle=False)
     train_dataset = BalancedAlternatingDataset([refalt_train, mutate_train], training_args.per_device_train_batch_size, 42)
+    eval_dataset = BalancedAlternatingDataset([refalt_eval, mutate_eval], training_args.per_device_eval_batch_size, 42, shuffle=False)
 
     # Load pretrained model and wrap with projection head
     base_model = AutoModel.from_pretrained(

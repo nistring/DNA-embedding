@@ -11,21 +11,22 @@ logger = logging.getLogger(__name__)
 
 
 class ClinVarRefAltDataset(Dataset):
-    """ClinVar dataset for cd_loss - returns (ref, alt) pairs."""
-    def __init__(self, path: str, tokenizer: transformers.PreTrainedTokenizer, sep: str = ","):
+    """ClinVar dataset for cd_loss - returns (ref, alt) pairs, balanced 1:1 pos/neg."""
+    def __init__(self, path: str, tokenizer: transformers.PreTrainedTokenizer, sep: str = ",", label: int = 1):
         super().__init__()
         with open(path, "r") as f:
-            self.samples = [{"ref": row["ref_seq"], "mut_idx": int(row["mut_idx"]), 
-                           "alt": row["alt"].upper(), "label": int(row["label"])}
-                          for row in csv.DictReader(f, delimiter=sep)]
+            samples = [{"ref": row["ref_seq"], "mut_idx": int(row["mut_idx"]), 
+                       "alt": row["alt"].upper(), "label": int(row["label"])}
+                      for row in csv.DictReader(f, delimiter=sep)]
+        self.sample = [s for s in samples if s["label"] == label]
         self.tokenizer = tokenizer
-        logger.info(f"Loaded {len(self.samples)} ClinVar ref-alt pairs for cd_loss")
+        logger.info(f"Loaded {len(self.sample)} samples with label {label} ClinVar ref-alt pairs")
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.sample)
 
     def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
-        s = self.samples[idx]
+        s = self.sample[idx]
         ref_seq, mi, alt, label = s["ref"], s["mut_idx"], s["alt"], s["label"]
         snv_seq = ref_seq[:mi] + alt + ref_seq[mi+1:]
 
@@ -38,37 +39,33 @@ class ClinVarRefAltDataset(Dataset):
             "labels": torch.tensor(label, dtype=torch.float32), "batch_type": torch.tensor(0, dtype=torch.long)}
 
 
-class ClinVarPathogenicDataset(Dataset):
-    """ClinVar dataset for cdd_loss - returns benign and pathogenic mutation sequences."""
+class ClinVarTripletDataset(Dataset):
+    """ClinVar dataset for triplet loss - returns (ref, pos, neg) triplets."""
     def __init__(self, path: str, tokenizer: transformers.PreTrainedTokenizer, sep: str = ","):
         super().__init__()
         with open(path, "r") as f:
-            samples = [{"ref": row["ref_seq"], "mut_idx": int(row["mut_idx"]), 
-                       "alt": row["alt"].upper(), "label": int(row["label"])}
-                      for row in csv.DictReader(f, delimiter=sep)]
-        # Group by label
-        self.benign = [s for s in samples if s["label"] == 0]
-        self.pathogenic = [s for s in samples if s["label"] == 1]
+            self.samples = [{"ref_seq": row["ref_seq"], "mut_idx": int(row["mut_idx"]), 
+                           "alt_pos": row["alt_pos"].upper(), "alt_neg": row["alt_neg"].upper()}
+                          for row in csv.DictReader(f, delimiter=sep)]
         self.tokenizer = tokenizer
-        logger.info(f"Loaded {len(self.benign)} benign and {len(self.pathogenic)} pathogenic mutations for cdd_loss")
+        logger.info(f"Loaded {len(self.samples)} ClinVar triplets for triplet loss")
 
     def __len__(self):
-        return max(len(self.benign), len(self.pathogenic))
+        return len(self.samples)
 
     def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
-        benign = self.benign[idx % len(self.benign)]
-        pathogenic = self.pathogenic[idx % len(self.pathogenic)]
-        
-        # Create mutation sequences
-        benign_seq = benign["ref"][:benign["mut_idx"]] + benign["alt"] + benign["ref"][benign["mut_idx"]+1:]
-        pathogenic_seq = pathogenic["ref"][:pathogenic["mut_idx"]] + pathogenic["alt"] + pathogenic["ref"][pathogenic["mut_idx"]+1:]
-        output = self.tokenizer([benign_seq, pathogenic_seq], padding="max_length", 
+        s = self.samples[idx]
+        ref_seq, mi, alt_pos, alt_neg = s["ref_seq"], s["mut_idx"], s["alt_pos"], s["alt_neg"]
+        pos_seq = ref_seq[:mi] + alt_pos + ref_seq[mi+1:]
+        neg_seq = ref_seq[:mi] + alt_neg + ref_seq[mi+1:]
+
+        output = self.tokenizer([ref_seq, pos_seq, neg_seq], padding="max_length", 
                                max_length=self.tokenizer.model_max_length, 
                                truncation=True, return_tensors="pt")
 
         # Omit attention_mask to reduce batch memory footprint; keep labels and batch_type
         return {"input_ids": output["input_ids"], \
-            "labels": torch.tensor([0, 1], dtype=torch.long), "batch_type": torch.tensor(1, dtype=torch.long)}
+            "labels": torch.tensor([0], dtype=torch.float32), "batch_type": torch.tensor(1, dtype=torch.long)}
 
 
 class ContrastiveMutateDataset(Dataset):

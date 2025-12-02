@@ -5,18 +5,18 @@
 # ========================================
 
 # Configuration
-export CUDA_VISIBLE_DEVICES=1  # Adjust based on available GPUs
+export CUDA_VISIBLE_DEVICES=0,1  # Adjust based on available GPUs
 export TORCH_DISTRIBUTED_BACKEND=nccl
 export OMP_NUM_THREADS=1
 
 # Number of GPUs to use
-NUM_GPUS=1
+NUM_GPUS=2
 
 # Model and data paths
 MODEL_NAME="songlab/gpn-brassicales"
 TOKENIZER_NAME="gonzalobenegas/tokenizer-dna-mlm"
 DATA_PATH="./data"  # Update with your data directory
-RUN_NAME="gpn_finetune_2datasets"
+RUN_NAME="gpn_finetune_2datasets_5"
 OUTPUT_DIR="./output/${RUN_NAME}"
 
 # Training hyperparameters
@@ -24,7 +24,7 @@ MAX_LENGTH=1024
 BATCH_SIZE=160
 GRAD_ACCUM=1
 LEARNING_RATE=1e-4
-EPOCHS=3           # Standard for most tasks
+EPOCHS=5           # Standard for most tasks
 SEED=42
 
 # Training options
@@ -45,6 +45,7 @@ torchrun --nproc_per_node=${NUM_GPUS} train.py \
     --use_reverse_complement \
     --pcc_loss_alpha 1 \
     --clinvar_csv ${DATA_PATH}/clinvar_compact_removed.csv \
+    --triplet_csv ${DATA_PATH}/paired_sequences.csv \
     --clinvar_sep "," \
     --refs_csv ${DATA_PATH}/bac_refs.csv \
     --refs_sep "," \
@@ -68,12 +69,12 @@ torchrun --nproc_per_node=${NUM_GPUS} train.py \
     --seed ${SEED} \
     --ddp_find_unused_parameters False \
     --dataloader_num_workers 48 \
-    --dataloader_pin_memory False \
+    --dataloader_pin_memory True \
     --remove_unused_columns False \
     --use_reverse_complement True \
     --bf16 --bf16_full_eval \
+    > "${OUTPUT_DIR}/training.log" 2>&1 &
     # --fp16 \
-    # > "${OUTPUT_DIR}/training.log" 2>&1 &
 
     #--soft_masked_loss_weight_train 0.1 --soft_masked_loss_weight_evaluation 0.0 \
 echo "Training complete! Model saved to ${OUTPUT_DIR}/joint"

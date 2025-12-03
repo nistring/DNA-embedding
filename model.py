@@ -68,14 +68,19 @@ class WithProjection(torch.nn.Module):
 
 
 class ContrastiveTrainer(transformers.Trainer):
-    """Custom trainer for supervised contrastive learning and mutation regression."""
-    def __init__(self, mutation_loss_weight=1.0, clinvar_loss_weight=1.0, pcc_loss_alpha=0.5, *args, **kwargs):
+    """Custom trainer for supervised contrastive learning and mutation regression.
+
+    Removed weighting hyperparameters and mixed MSE/Pearson alpha. Uses only Pearson-based loss
+    for mutation regression and exposes a configurable cosine loss margin via training args.
+    """
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.mutation_loss_weight = mutation_loss_weight
-        self.clinvar_loss_weight = clinvar_loss_weight
-        self.pcc_loss_alpha = pcc_loss_alpha
         self.num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
-        self.cos_loss = torch.nn.CosineEmbeddingLoss(-0.8)
+        # Training cosine embedding loss margin configurable via TrainingArguments (cos_loss_margin)
+        margin = getattr(self.args, "cos_loss_margin", -0.8)
+        self.cos_loss = torch.nn.CosineEmbeddingLoss(margin)
+        # Evaluation loss keeps a stricter margin; could be aligned if desired
+        self.cos_eval = torch.nn.CosineEmbeddingLoss(-1.0)
         self.triplet_loss = torch.nn.TripletMarginWithDistanceLoss(margin=1.5, distance_function=lambda x, y: 1 - torch.cosine_similarity(x, y))
 
     def _get_train_sampler(self, train_dataset=None):
@@ -94,13 +99,10 @@ class ContrastiveTrainer(transformers.Trainer):
         batch_type = inputs.pop("batch_type")
         outputs = model(**inputs)
 
-        # Check if we should log this step
-        should_log = self.state.global_step % self.args.logging_steps <= 1
+        should_log = self.state.global_step % self.args.logging_steps <= 2
 
         loss = self.contrastive_loss_func(
             outputs, labels, batch_type,
-            self.mutation_loss_weight, self.clinvar_loss_weight,
-            alpha=self.pcc_loss_alpha,
             should_log=should_log)
 
         return (loss, outputs) if return_outputs else loss
@@ -113,17 +115,13 @@ class ContrastiveTrainer(transformers.Trainer):
         inputs = self._prepare_inputs(inputs)
         labels = inputs.pop("labels")
         batch_type = inputs.pop("batch_type")
-        
         with torch.no_grad():
             outputs = model(**inputs)
-        
-        loss = self.contrastive_loss_func(
-            outputs, labels, batch_type,
-            self.mutation_loss_weight, self.clinvar_loss_weight,
-            alpha=self.pcc_loss_alpha,
-            should_log=False
-        ) * self.num_gpus
-        
+            loss = self.contrastive_loss_func(
+                outputs, labels, batch_type,
+                should_log=False, is_train=False,
+            ) * self.num_gpus
+            
         if prediction_loss_only:
             return (loss, None, None)
         
@@ -134,7 +132,7 @@ class ContrastiveTrainer(transformers.Trainer):
         return (loss, logits, labels)
 
 
-    def contrastive_loss_func(self, embeddings, labels, batch_type, mutation_loss_weight=1.0, clinvar_loss_weight=1.0, alpha=0.5, should_log=False):
+    def contrastive_loss_func(self, embeddings, labels, batch_type, should_log=False, is_train=True):
         """Custom loss function for supervised contrastive learning and mutation regression.
         
         batch_type: 0=cd_loss (ref-alt), 1=cdd_loss (benign-pathogenic), 2=pcc_loss (mutation)
@@ -142,10 +140,13 @@ class ContrastiveTrainer(transformers.Trainer):
         embeddings = embeddings[0].view(labels.shape[0], 3 if batch_type == 1 else 2, -1)
 
         if batch_type == 0:  # cd_loss: ref-alt comparison
-            loss = self.cos_loss(embeddings[:, 0], embeddings[:, 1], labels)
+            if is_train:
+                loss = self.cos_loss(embeddings[:, 0], -embeddings[:, 1], -labels)
+            else:
+                loss = self.cos_eval(embeddings[:, 0], -embeddings[:, 1], -labels)
             if should_log:
                 logger.info(f"cos_loss: {loss.item():.4f}")
-            return clinvar_loss_weight * loss
+            return loss
         
         elif batch_type == 1:  # cdd_loss: benign-pathogenic comparison
             triplet_loss = self.triplet_loss(
@@ -155,7 +156,7 @@ class ContrastiveTrainer(transformers.Trainer):
             )
             if should_log:
                 logger.info(f"triplet_loss: {triplet_loss.item():.4f}")
-            return clinvar_loss_weight * triplet_loss
+            return triplet_loss
             
             # https://github.com/GuillaumeErhard/Supervised_contrastive_loss_pytorch/blob/main/loss/spc.py
             # temperature = 0.07
@@ -180,11 +181,11 @@ class ContrastiveTrainer(transformers.Trainer):
             # return supervised_contrastive_loss
 
 
-        else:  # bt == 2: pcc_loss for mutation regression
+        else:  # bt == 2: Pearson-only loss for mutation regression
             cos_sim = (1 - torch.cosine_similarity(embeddings[:, 0], embeddings[:, 1], dim=-1)) / 2
-            labels = labels / 10
-            pcc_loss = (1 - alpha) * torch.nn.functional.mse_loss(cos_sim, labels) + \
-                alpha * (1 - torch.nan_to_num(torch.corrcoef(torch.stack([cos_sim, labels]))[0,1])) / 2
+            # Pure Pearson-based loss: (1 - r)/2
+            pearson = torch.nan_to_num(torch.corrcoef(torch.stack([cos_sim, labels]))[0, 1])
+            pcc_loss = (1 - pearson) / 2
             if should_log:
-                logger.info(f"pcc_loss: {pcc_loss.item():.4f}")
-            return mutation_loss_weight * pcc_loss
+                logger.info(f"pearson_loss: {pcc_loss.item():.4f}")
+            return pcc_loss

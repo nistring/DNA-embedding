@@ -19,6 +19,8 @@ from my_datasets import (
 )
 from model import WithProjection, ContrastiveTrainer
 
+from copy import deepcopy
+
 # Setup logging
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -59,7 +61,7 @@ class TrainingArguments(transformers.TrainingArguments):
     load_best_model_at_end: bool = field(default=True, metadata={"help": "Load best model at training end"})
     metric_for_best_model: str = field(default="eval_loss", metadata={"help": "Metric to use for best model selection"})
     greater_is_better: bool = field(default=False, metadata={"help": "Whether higher metric is better"})
-    pcc_loss_alpha: float = field(default=0.5, metadata={"help": "Alpha parameter for PCC loss weighting (correlation vs MSE)"})
+    cos_loss_margin: float = field(default=-0.8, metadata={"help": "Margin parameter for training CosineEmbeddingLoss"})
 
 def main():
     """Main training function for contrastive learning."""
@@ -98,8 +100,8 @@ def main():
     train_idx, eval_idx = train_test_split(list(range(len(refneg_dataset))), test_size=0.05, random_state=42)
     refneg_train, refneg_eval = torch.utils.data.Subset(refneg_dataset, train_idx), torch.utils.data.Subset(refneg_dataset, eval_idx)
     
-    refalt_train = BalancedAlternatingDataset([refpos_train, refneg_train], training_args.per_device_train_batch_size, 42)
-    refalt_eval = BalancedAlternatingDataset([refpos_eval, refneg_eval], training_args.per_device_eval_batch_size, 42, shuffle=False)
+    # refalt_train = BalancedAlternatingDataset([refpos_train, refneg_train], training_args.per_device_train_batch_size, 42)
+    # refalt_eval = BalancedAlternatingDataset([refpos_eval, refneg_eval], training_args.per_device_eval_batch_size, 42, shuffle=False)
     
     # train_idx, eval_idx = train_test_split(list(range(len(pathogenic_dataset))), test_size=0.05, random_state=42)
     # pathogenic_train, pathogenic_eval = torch.utils.data.Subset(pathogenic_dataset, train_idx), torch.utils.data.Subset(pathogenic_dataset, eval_idx)
@@ -108,8 +110,8 @@ def main():
     mutate_train, mutate_eval = torch.utils.data.Subset(mutate_dataset, train_idx), torch.utils.data.Subset(mutate_dataset, eval_idx)
     
     # Combine three datasets with alternating batches
-    train_dataset = BalancedAlternatingDataset([refalt_train, mutate_train], training_args.per_device_train_batch_size, 42)
-    eval_dataset = BalancedAlternatingDataset([refalt_eval, mutate_eval], training_args.per_device_eval_batch_size, 42, shuffle=False)
+    train_dataset = BalancedAlternatingDataset([refpos_train, refneg_train, mutate_train], training_args.per_device_train_batch_size, 42)
+    eval_dataset = BalancedAlternatingDataset([refpos_eval, refneg_eval, mutate_eval], training_args.per_device_eval_batch_size, 42, shuffle=False)
 
     # Load pretrained model and wrap with projection head
     base_model = AutoModel.from_pretrained(
@@ -141,7 +143,6 @@ def main():
     logger.info(f"Model hidden dimension: {base_model.config.hidden_size if hasattr(base_model.config, 'hidden_size') else 'unknown'}")
     
     trainer = ContrastiveTrainer(
-        mutation_loss_weight=1.0, clinvar_loss_weight=1.0, pcc_loss_alpha=training_args.pcc_loss_alpha,
         model=model, args=training_args, train_dataset=train_dataset, eval_dataset=eval_dataset,
         data_collator=ContrastiveDataCollator())
 

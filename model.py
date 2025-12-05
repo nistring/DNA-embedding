@@ -1,191 +1,130 @@
 import logging
-
 import torch
 from torch.utils.data import SequentialSampler
-
+from torch.utils.checkpoint import checkpoint
 import transformers
 
 logger = logging.getLogger(__name__)
 
 
 class ProjectionHead(torch.nn.Module):
-    """Projection head combining SNV-specific token with multi-pooling sequence context."""
-    def __init__(self, input_dim=512, output_dim=2048, snv_pos=None):
+    """Enhanced projection head with multi-layer max-pooling, MHA, and SNV-focused features."""
+    
+    def __init__(self, input_dim=512, output_dim=2048, snv_pos=511, num_heads=8):
         super().__init__()
         self.input_dim = input_dim
-        self.snv_pos = snv_pos  # Position of SNV token, if None uses adaptive position
+        self.snv_pos = snv_pos
+        
+        self.mutation_pos_encoding = torch.nn.Parameter(torch.randn(1, 1, input_dim) * 0.02)
+        self.mha = torch.nn.MultiheadAttention(input_dim, num_heads, batch_first=True)
+        self.layer_norm_mha = torch.nn.LayerNorm(input_dim)
+        
         self.conv = torch.nn.Sequential(
             torch.nn.Conv1d(input_dim, input_dim, kernel_size=5, padding=0, groups=input_dim),
             torch.nn.Conv1d(input_dim, input_dim, kernel_size=1),
             torch.nn.GELU(),
         )
-        self.dense = torch.nn.Sequential(
-            torch.nn.Linear(input_dim * 4, output_dim)
-        )
-
-    def forward(self, x):
-        # x: (B*2, seq_len, D)
-        snv_pos = 511
-
-        snv_feat = x[:, snv_pos, :]
-        local_feat = self.conv(x[:, snv_pos-2:snv_pos+3, :].permute(0, 2, 1)).squeeze(-1)
-        mean_feat = x.mean(dim=1)  
-        max_feat = x.max(dim=1)[0]  
         
-        # Concatenate: (B, D + D + D + D) = (B, 4*D)
-        combined = torch.cat([snv_feat, local_feat, mean_feat, max_feat], dim=-1)
+        self.dense = torch.nn.Linear(input_dim * 4, output_dim)
+        
+    def forward(self, hidden_states_list):
+        stacked = torch.stack(hidden_states_list, dim=1)
+        max_pooled = stacked.max(dim=1)[0]
+        
+        aggregated, _ = self.mha(max_pooled, max_pooled, max_pooled)
+        aggregated = self.layer_norm_mha(aggregated)
+        
+        mean_pool = aggregated.mean(dim=1)
+        max_pool = aggregated.max(dim=1)[0]
+        global_feat = torch.cat([mean_pool, max_pool], dim=-1)
+        
+        max_pooled[:, self.snv_pos, :] += self.mutation_pos_encoding.squeeze(0)
+        snv_feat = max_pooled[:, self.snv_pos, :]
+        
+        local_window = max_pooled[:, self.snv_pos-2:self.snv_pos+3, :]
+        local_feat = self.conv(local_window.permute(0, 2, 1)).squeeze(-1)
+        
+        combined = torch.cat([global_feat, snv_feat, local_feat], dim=-1)
         return self.dense(combined)
 
-
-class WithProjection(torch.nn.Module):
-    """Wrapper model that adds projection head."""
     
-    def __init__(self, base_model, input_dim=None, output_dim=2048, model_type=None):
+class WithProjection(torch.nn.Module):
+    """Wrapper model with projection head and Flash Attention support."""
+    
+    def __init__(self, base_model, input_dim=None, output_dim=2048, model_type=None, 
+                 num_heads=8, num_layers=4, snv_pos=511):
         super().__init__()
         self.base_model = base_model
         self.model_type = model_type
+        self.num_layers = num_layers
         
-        # Auto-detect input dimension if not provided
         if input_dim is None:
-            if hasattr(base_model, 'config') and hasattr(base_model.config, 'hidden_size'):
-                input_dim = base_model.config.hidden_size
-            else:
-                input_dim = 768  # Default for most transformers
+            input_dim = getattr(base_model.config, 'hidden_size', 768)
         
-        self.projection_head = ProjectionHead(input_dim, output_dim)
-        # Copy config from base model for compatibility
+        self.projection_head = ProjectionHead(input_dim, output_dim, snv_pos=snv_pos, num_heads=num_heads)
         self.config = base_model.config
+        
+        if hasattr(self.config, 'output_hidden_states'):
+            self.config.output_hidden_states = True
     
     def forward(self, input_ids, *args, **kwargs):
-        """Forward pass through base model and projection head."""
-        # Allow attention_mask to be optional to reduce memory in collated batches
-        outputs = self.base_model(input_ids)
-        # Extract last_hidden_state and apply projection
-        # outputs = outputs.hidden_states[-1]
-        outputs = outputs.last_hidden_state
-        projected = self.projection_head(outputs)
+        kwargs['output_hidden_states'] = True
+        outputs = self.base_model(input_ids, **kwargs)
+        
+        hidden_states_list = (list(outputs.hidden_states[-self.num_layers:]) 
+                             if hasattr(outputs, 'hidden_states') and outputs.hidden_states 
+                             else [outputs.last_hidden_state])
+        
+        projected = (checkpoint(self.projection_head, hidden_states_list, use_reentrant=False) 
+                    if self.training else self.projection_head(hidden_states_list))
+        
         return (projected,)
 
 
 class ContrastiveTrainer(transformers.Trainer):
-    """Custom trainer for supervised contrastive learning and mutation regression.
-
-    Removed weighting hyperparameters and mixed MSE/Pearson alpha. Uses only Pearson-based loss
-    for mutation regression and exposes a configurable cosine loss margin via training args.
-    """
+    """Custom trainer for supervised contrastive learning and mutation regression."""
+    
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
-        # Training cosine embedding loss margin configurable via TrainingArguments (cos_loss_margin)
-        margin = getattr(self.args, "cos_loss_margin", -0.8)
-        self.cos_loss = torch.nn.CosineEmbeddingLoss(margin)
-        # Evaluation loss keeps a stricter margin; could be aligned if desired
-        self.cos_eval = torch.nn.CosineEmbeddingLoss(-1.0)
-        self.triplet_loss = torch.nn.TripletMarginWithDistanceLoss(margin=1.5, distance_function=lambda x, y: 1 - torch.cosine_similarity(x, y))
+        self.margin = getattr(self.args, "cos_loss_margin", -0.8)
 
     def _get_train_sampler(self, train_dataset=None):
-        """Use SequentialSampler for monotonously increasing indices."""
-        if train_dataset is None:
-            train_dataset = self.train_dataset
-        return SequentialSampler(train_dataset)
+        return SequentialSampler(train_dataset or self.train_dataset)
 
     def _get_eval_sampler(self, eval_dataset):
-        """Use SequentialSampler for eval as well."""
-        return SequentialSampler(eval_dataset)
+        return SequentialSampler(eval_dataset) if eval_dataset else None
+    
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        eval_dataset = eval_dataset or self.eval_dataset
+        if eval_dataset is None:
+            logger.info("No eval dataset provided, skipping evaluation")
+            return {}
+        return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """Compute custom contrastive loss for both training and evaluation."""
         labels = inputs.pop("labels")
         batch_type = inputs.pop("batch_type")
         outputs = model(**inputs)
 
-        should_log = self.state.global_step % self.args.logging_steps <= 2
-
         loss = self.contrastive_loss_func(
             outputs, labels, batch_type,
-            should_log=should_log)
+            should_log=self.state.global_step % self.args.logging_steps <= 1)
 
         return (loss, outputs) if return_outputs else loss
 
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        """
-        Perform a prediction step using custom contrastive loss for both training and evaluation.
-        Overrides parent's prediction_step to use our custom loss function.
-        """
-        inputs = self._prepare_inputs(inputs)
-        labels = inputs.pop("labels")
-        batch_type = inputs.pop("batch_type")
-        with torch.no_grad():
-            outputs = model(**inputs)
-            loss = self.contrastive_loss_func(
-                outputs, labels, batch_type,
-                should_log=False, is_train=False,
-            ) * self.num_gpus
-            
-        if prediction_loss_only:
-            return (loss, None, None)
-        
-        logits = outputs.get("last_hidden_state") if isinstance(outputs, dict) else (
-            outputs[0] if isinstance(outputs, (tuple, list)) else outputs
-        )
-        
-        return (loss, logits, labels)
-
-
     def contrastive_loss_func(self, embeddings, labels, batch_type, should_log=False, is_train=True):
-        """Custom loss function for supervised contrastive learning and mutation regression.
-        
-        batch_type: 0=cd_loss (ref-alt), 1=cdd_loss (benign-pathogenic), 2=pcc_loss (mutation)
-        """
-        embeddings = embeddings[0].view(labels.shape[0], 3 if batch_type == 1 else 2, -1)
+        embeddings = embeddings[0].view(labels.shape[0], 2, -1)
 
-        if batch_type == 0:  # cd_loss: ref-alt comparison
-            if is_train:
-                loss = self.cos_loss(embeddings[:, 0], -embeddings[:, 1], -labels)
-            else:
-                loss = self.cos_eval(embeddings[:, 0], -embeddings[:, 1], -labels)
+        if batch_type == 0:
+            loss = torch.cosine_similarity(embeddings[:, 0], embeddings[:, 1], dim=-1)
+            loss = (loss[labels == -1].sum() + (loss[labels == 1] - self.margin).abs().sum()) / labels.shape[0]
             if should_log:
                 logger.info(f"cos_loss: {loss.item():.4f}")
             return loss
-        
-        elif batch_type == 1:  # cdd_loss: benign-pathogenic comparison
-            triplet_loss = self.triplet_loss(
-                embeddings[:, 0],  # anchor: ref
-                embeddings[:, 1],  # positive: benign
-                embeddings[:, 2]   # negative: pathogenic
-            )
-            if should_log:
-                logger.info(f"triplet_loss: {triplet_loss.item():.4f}")
-            return triplet_loss
-            
-            # https://github.com/GuillaumeErhard/Supervised_contrastive_loss_pytorch/blob/main/loss/spc.py
-            # temperature = 0.07
-            # projections = embeddings.view(embeddings.shape[0]*2, -1)  # (B*2, D)
-            # targets = labels.view(-1)  # (B*2,)
-            # dot_product_tempered = torch.mm(projections, projections.T) / temperature
-            # # Minus max for numerical stability with exponential. Same done in cross entropy. Epsilon added to avoid log(0)
-            # exp_dot_tempered = (
-            #     torch.exp(dot_product_tempered - torch.max(dot_product_tempered, dim=1, keepdim=True)[0]) + 1e-5
-            # )
-
-            # mask_similar_class = targets.unsqueeze(1).repeat(1, targets.shape[0]) == targets
-            # mask_anchor_out = (1 - torch.eye(exp_dot_tempered.shape[0])).to(embeddings.device)
-            # mask_combined = mask_similar_class * mask_anchor_out
-            # cardinality_per_samples = torch.sum(mask_combined, dim=1)
-
-            # log_prob = -torch.log(exp_dot_tempered / (torch.sum(exp_dot_tempered * mask_anchor_out, dim=1, keepdim=True)))
-            # supervised_contrastive_loss_per_sample = torch.sum(log_prob * mask_combined, dim=1) / cardinality_per_samples
-            # supervised_contrastive_loss = torch.mean(supervised_contrastive_loss_per_sample)
-            # if should_log:
-            #     logger.info(f"cdd_loss: {supervised_contrastive_loss.item():.4f}")
-            # return supervised_contrastive_loss
-
-
-        else:  # bt == 2: Pearson-only loss for mutation regression
+        else:
             cos_sim = (1 - torch.cosine_similarity(embeddings[:, 0], embeddings[:, 1], dim=-1)) / 2
-            # Pure Pearson-based loss: (1 - r)/2
-            pearson = torch.nan_to_num(torch.corrcoef(torch.stack([cos_sim, labels]))[0, 1])
-            pcc_loss = (1 - pearson) / 2
+            loss = -torch.nan_to_num(torch.corrcoef(torch.stack([cos_sim, labels]))[0, 1])
             if should_log:
-                logger.info(f"pearson_loss: {pcc_loss.item():.4f}")
-            return pcc_loss
+                logger.info(f"pearson_loss: {loss.item():.4f}")
+            return loss

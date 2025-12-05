@@ -65,14 +65,10 @@ def main():
             # sanity: reference base matches fasta at center
             if seq[mut_idx] != ref:
                 continue
-            if "Pathogenic" in cl:
-                label = -1
-            elif "Likely_pathogenic" in cl:
+            if "Pathogenic" in cl or "Likely_pathogenic" in cl:
                 label = -1
             elif "Benign" in cl:
                 label = 1
-            elif "Likely_benign" in cl:
-                label = 2
             else:
                 # Remove: Uncertain, Likely Benign, Conflicting, Not Provided, Other
                 continue

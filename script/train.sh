@@ -1,8 +1,7 @@
 #!/bin/bash
 
 # ========================================
-# DNABERT-2 Distributed Training Script
-# Official settings from DNABERT-2 paper and repository
+# GPN Distributed Training Script
 # ========================================
 
 # Configuration
@@ -14,34 +13,39 @@ export OMP_NUM_THREADS=1
 NUM_GPUS=2
 
 # Model and data paths
-MODEL_NAME="zhihan1996/DNABERT-2-117M"
+MODEL_NAME="songlab/gpn-brassicales"
+TOKENIZER_NAME="gonzalobenegas/tokenizer-dna-mlm"
 DATA_PATH="./data"  # Update with your data directory
-OUTPUT_DIR="./output/dnabert2_finetune"
-RUN_NAME="dnabert2_finetune"
+RUN_NAME="gpn_finetune_2datasets_0.0_e3"
+OUTPUT_DIR="./output/${RUN_NAME}"
 
 # Training hyperparameters
-MAX_LENGTH=256
-BATCH_SIZE=128
-GRAD_ACCUM=2
-LEARNING_RATE=3e-6 # Official DNABERT-2 learning rate
+MAX_LENGTH=1024
+BATCH_SIZE=96
+GRAD_ACCUM=1
+LEARNING_RATE=1e-4
 EPOCHS=3           # Standard for most tasks
 SEED=42
 
-# Training options (official DNABERT-2 settings)
-WARMUP_STEPS=100     # Official standard
-EVAL_STEPS=50      # Official evaluation frequency
-LOGGING_STEPS=10 # Keep high to reduce logging overhead
-EVAL_STRATEGY="epoch"  # Evaluate based on eval_steps
-LR_SCHEDULER_TYPE="inverse_sqrt"  # Custom inverse_sqrt scheduler with rapid decay
+# Training options
+WARMUP_STEPS=0     # Official standard
+EVAL_STEPS=1854 # 3708      # Official evaluation frequency
+LOGGING_STEPS=50 # Keep high to reduce logging overhead
+EVAL_STRATEGY="no"  # Evaluate based on eval_steps
+LR_SCHEDULER_TYPE="linear"  # Custom inverse_sqrt scheduler with rapid decay
 
-echo "Starting DNABERT-2 distributed training with joint ClinVar + mutation datasets..."
+echo "Starting ${RUN_NAME} distributed training..."
 echo "Settings: LR=${LEARNING_RATE}, Batch=${BATCH_SIZE}, GradAccum=${GRAD_ACCUM}, Epochs=${EPOCHS}, Scheduler=${LR_SCHEDULER_TYPE}, Warmup=${WARMUP_STEPS}"
-torchrun --nproc_per_node=${NUM_GPUS} train_dnabert2_ddp.py \
+mkdir -p ${OUTPUT_DIR}
+torchrun --nproc_per_node=${NUM_GPUS} train.py \
     --model_name_or_path ${MODEL_NAME} \
+    --tokenizer_name ${TOKENIZER_NAME} \
+    --weight_decay 0.01 \
+    --model_type GPN \
     --clinvar_csv ${DATA_PATH}/clinvar_compact.csv \
     --clinvar_sep "," \
-    --refs_csv ${DATA_PATH}/bac_refs.csv \
-    --refs_sep "," \
+    --refs_fasta ${DATA_PATH}/hg38.fa \
+    --test_csv ${DATA_PATH}/test.csv \
     --run_name ${RUN_NAME} \
     --output_dir ${OUTPUT_DIR}/joint \
     --model_max_length ${MAX_LENGTH} \
@@ -50,23 +54,25 @@ torchrun --nproc_per_node=${NUM_GPUS} train_dnabert2_ddp.py \
     --gradient_accumulation_steps ${GRAD_ACCUM} \
     --learning_rate ${LEARNING_RATE} \
     --num_train_epochs ${EPOCHS} \
-    --fp16 \
     --max_grad_norm 1.0 \
-    --save_strategy ${EVAL_STRATEGY} \
+    --save_strategy "epoch" \
     --eval_strategy ${EVAL_STRATEGY} \
+    --eval_steps ${EVAL_STEPS} \
     --do_train True \
-    --do_eval True \
+    --do_eval False \
     --logging_steps ${LOGGING_STEPS} \
     --lr_scheduler_type ${LR_SCHEDULER_TYPE} \
     --overwrite_output_dir True \
     --log_level info \
     --seed ${SEED} \
-    --find_unused_parameters False \
+    --ddp_find_unused_parameters False \
     --dataloader_num_workers 48 \
     --dataloader_pin_memory True \
     --remove_unused_columns False \
-    # --warmup_steps ${WARMUP_STEPS} \
-    # --save_steps ${EVAL_STEPS} \
-    # --eval_steps ${EVAL_STEPS}
+    --bf16 --bf16_full_eval \
+    --cos_loss_margin 0
+# > "${OUTPUT_DIR}/training.log" 2>&1 &
+# --fp16 \
 
+#--soft_masked_loss_weight_train 0.1 --soft_masked_loss_weight_evaluation 0.0 \
 echo "Training complete! Model saved to ${OUTPUT_DIR}/joint"

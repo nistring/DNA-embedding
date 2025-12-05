@@ -1,5 +1,5 @@
-ckdir="gpn_finetune_2datasets_0.9_e5"
-ckpt="checkpoint-13620"
+ckdir="gpn_finetune_2datasets_0.8_e5_1"
+ckpt="checkpoint-10899"
 python generate_embeddings.py \
     --input_csv data/test.csv \
     --checkpoint_dir "output/$ckdir/joint/$ckpt" \

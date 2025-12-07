@@ -1,7 +1,6 @@
 import logging
 import torch
 from torch.utils.data import SequentialSampler
-from torch.utils.checkpoint import checkpoint
 import transformers
 
 logger = logging.getLogger(__name__)
@@ -15,7 +14,6 @@ class ProjectionHead(torch.nn.Module):
         self.input_dim = input_dim
         self.snv_pos = snv_pos
         
-        self.mutation_pos_encoding = torch.nn.Parameter(torch.randn(1, 1, input_dim) * 0.02)
         self.mha = torch.nn.MultiheadAttention(input_dim, num_heads, batch_first=True)
         self.layer_norm_mha = torch.nn.LayerNorm(input_dim)
         
@@ -30,21 +28,14 @@ class ProjectionHead(torch.nn.Module):
     def forward(self, hidden_states_list):
         stacked = torch.stack(hidden_states_list, dim=1)
         max_pooled = stacked.max(dim=1)[0]
+        mean_pooled = stacked.mean(dim=1)
+
+        snv_feat = mean_pooled[:, self.snv_pos, :] 
+        local_feat = self.conv(mean_pooled[:, self.snv_pos-2:self.snv_pos+3, :].permute(0, 2, 1)).squeeze(-1)
         
-        aggregated, _ = self.mha(max_pooled, max_pooled, max_pooled)
-        aggregated = self.layer_norm_mha(aggregated)
-        
-        mean_pool = aggregated.mean(dim=1)
-        max_pool = aggregated.max(dim=1)[0]
-        global_feat = torch.cat([mean_pool, max_pool], dim=-1)
-        
-        max_pooled[:, self.snv_pos, :] += self.mutation_pos_encoding.squeeze(0)
-        snv_feat = max_pooled[:, self.snv_pos, :]
-        
-        local_window = max_pooled[:, self.snv_pos-2:self.snv_pos+3, :]
-        local_feat = self.conv(local_window.permute(0, 2, 1)).squeeze(-1)
-        
-        combined = torch.cat([global_feat, snv_feat, local_feat], dim=-1)
+        aggregated = self.layer_norm_mha(self.mha(max_pooled, max_pooled, max_pooled)[0])
+
+        combined = torch.cat([aggregated.mean(dim=1), aggregated.max(dim=1)[0], snv_feat, local_feat], dim=-1)
         return self.dense(combined)
 
     
@@ -75,8 +66,7 @@ class WithProjection(torch.nn.Module):
                              if hasattr(outputs, 'hidden_states') and outputs.hidden_states 
                              else [outputs.last_hidden_state])
         
-        projected = (checkpoint(self.projection_head, hidden_states_list, use_reentrant=False) 
-                    if self.training else self.projection_head(hidden_states_list))
+        projected = (self.projection_head(hidden_states_list))
         
         return (projected,)
 
@@ -87,7 +77,9 @@ class ContrastiveTrainer(transformers.Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
-        self.margin = getattr(self.args, "cos_loss_margin", -0.8)
+        self.margin = getattr(self.args, "cos_loss_margin", 0.8)
+        self.mse_loss = torch.nn.MSELoss()
+        self.cos_loss = torch.nn.CosineEmbeddingLoss(margin=-self.margin)
 
     def _get_train_sampler(self, train_dataset=None):
         return SequentialSampler(train_dataset or self.train_dataset)
@@ -119,12 +111,13 @@ class ContrastiveTrainer(transformers.Trainer):
         if batch_type == 0:
             loss = torch.cosine_similarity(embeddings[:, 0], embeddings[:, 1], dim=-1)
             loss = (loss[labels == -1].sum() + (loss[labels == 1] - self.margin).abs().sum()) / labels.shape[0]
+            # loss = self.cos_loss(embeddings[:, 0], -embeddings[:, 1], -labels)
             if should_log:
                 logger.info(f"cos_loss: {loss.item():.4f}")
             return loss
         else:
-            cos_sim = (1 - torch.cosine_similarity(embeddings[:, 0], embeddings[:, 1], dim=-1)) / 2
-            loss = -torch.nan_to_num(torch.corrcoef(torch.stack([cos_sim, labels]))[0, 1])
+            cd = (1 - torch.cosine_similarity(embeddings[:, 0], embeddings[:, 1], dim=-1))/2
+            loss = self.mse_loss(cd, labels) # - torch.corrcoef(torch.stack([cd, labels]))[0, 1]
             if should_log:
                 logger.info(f"pearson_loss: {loss.item():.4f}")
-            return loss
+            return loss 

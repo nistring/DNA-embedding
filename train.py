@@ -3,13 +3,14 @@ from dataclasses import dataclass, field
 from typing import Optional
 import os
 import csv
+import shutil
 from tqdm import tqdm
 
 import torch
 import transformers
 from transformers import AutoTokenizer, AutoModel, TrainerCallback
 
-from my_datasets import (
+from dataset import (
     ClinVarRefAltDataset,
     ContrastiveMutateDataset,
     BalancedAlternatingDataset,
@@ -55,15 +56,8 @@ class EvaluationCallback(TrainerCallback):
     def __init__(self, tokenizer, test_csv, training_args):
         self.tokenizer = tokenizer
         self.test_csv = test_csv
-        self.eval_steps = training_args.eval_steps or 100
-        self.last_eval_step = -1
         self.test_dir = os.path.join(os.path.dirname(test_csv), "..", "test", "results")
         self.eval_batch_size = getattr(training_args, "per_device_eval_batch_size", 32)
-        
-    def on_step_end(self, args, state, control, **kwargs):
-        if (model := kwargs.get("model")) and state.global_step % self.eval_steps == 0 and state.global_step > self.last_eval_step:
-            self.last_eval_step = state.global_step
-            self._eval_and_log(model, f"step {state.global_step}")
     
     def on_epoch_end(self, args, state, control, **kwargs):
         if model := kwargs.get("model"):
@@ -125,6 +119,16 @@ def main():
     model = WithProjection(base_model, input_dim=None, output_dim=model_args.projection_output_dim, model_type=model_args.model_type)
 
     logger.info(f"Model hidden dimension: {getattr(base_model.config, 'hidden_size', 'unknown')}")
+    
+    # Create output directory and copy training script
+    os.makedirs(training_args.output_dir, exist_ok=True)
+    train_script_path = os.path.join(os.path.dirname(__file__), "script", "train.sh")
+    if os.path.exists(train_script_path):
+        dest_path = os.path.join(training_args.output_dir, "train.sh")
+        shutil.copy2(train_script_path, dest_path)
+        logger.info(f"Copied training script to {dest_path}")
+    else:
+        logger.warning(f"Training script not found at {train_script_path}")
     
     callbacks = [EvaluationCallback(tokenizer, data_args.test_csv, training_args)]
     

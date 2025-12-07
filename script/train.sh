@@ -16,7 +16,7 @@ NUM_GPUS=2
 MODEL_NAME="songlab/gpn-brassicales"
 TOKENIZER_NAME="gonzalobenegas/tokenizer-dna-mlm"
 DATA_PATH="./data"  # Update with your data directory
-RUN_NAME="gpn_finetune_2datasets_0.0_e3"
+RUN_NAME="0.9_abs"
 OUTPUT_DIR="./output/${RUN_NAME}"
 
 # Training hyperparameters
@@ -32,7 +32,7 @@ WARMUP_STEPS=0     # Official standard
 EVAL_STEPS=1854 # 3708      # Official evaluation frequency
 LOGGING_STEPS=50 # Keep high to reduce logging overhead
 EVAL_STRATEGY="no"  # Evaluate based on eval_steps
-LR_SCHEDULER_TYPE="linear"  # Custom inverse_sqrt scheduler with rapid decay
+LR_SCHEDULER_TYPE="cosine"  # Custom inverse_sqrt scheduler with rapid decay
 
 echo "Starting ${RUN_NAME} distributed training..."
 echo "Settings: LR=${LEARNING_RATE}, Batch=${BATCH_SIZE}, GradAccum=${GRAD_ACCUM}, Epochs=${EPOCHS}, Scheduler=${LR_SCHEDULER_TYPE}, Warmup=${WARMUP_STEPS}"
@@ -42,7 +42,7 @@ torchrun --nproc_per_node=${NUM_GPUS} train.py \
     --tokenizer_name ${TOKENIZER_NAME} \
     --weight_decay 0.01 \
     --model_type GPN \
-    --clinvar_csv ${DATA_PATH}/clinvar_compact.csv \
+    --clinvar_csv ${DATA_PATH}/clinvar_compact_removed.csv \
     --clinvar_sep "," \
     --refs_fasta ${DATA_PATH}/hg38.fa \
     --test_csv ${DATA_PATH}/test.csv \
@@ -57,7 +57,6 @@ torchrun --nproc_per_node=${NUM_GPUS} train.py \
     --max_grad_norm 1.0 \
     --save_strategy "epoch" \
     --eval_strategy ${EVAL_STRATEGY} \
-    --eval_steps ${EVAL_STEPS} \
     --do_train True \
     --do_eval False \
     --logging_steps ${LOGGING_STEPS} \
@@ -70,8 +69,8 @@ torchrun --nproc_per_node=${NUM_GPUS} train.py \
     --dataloader_pin_memory True \
     --remove_unused_columns False \
     --bf16 --bf16_full_eval \
-    --cos_loss_margin 0
-# > "${OUTPUT_DIR}/training.log" 2>&1 &
+    --cos_loss_margin 0.9 \
+    > "${OUTPUT_DIR}/training.log" 2>&1 &
 # --fp16 \
 
 #--soft_masked_loss_weight_train 0.1 --soft_masked_loss_weight_evaluation 0.0 \

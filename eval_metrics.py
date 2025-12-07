@@ -48,9 +48,9 @@ def compute_test_metrics(embeddings_dict, test_dir="test/results"):
                     mut_counts.append(int(row["distance"]))
         
         if len(distances_list) > 1:
-            pcc, pvalue = pearsonr(np.array(distances_list), np.array(mut_counts))
+            pcc, pvalue = pearsonr(np.array(distances_list), np.array(mut_counts)) #np.log2(np.array(mut_counts)) / 9.0)
             metrics.update({"pcc": pcc})
 
-    metrics.update({"mean": (metrics["cd"] + (1 + metrics["cdd"])/2 + (1 + metrics["pcc"])/2)/3} )
+    metrics.update({"mean": (metrics["cd"] + metrics["cdd"] + metrics["pcc"])/3} )
     
     return metrics

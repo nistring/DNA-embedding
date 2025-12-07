@@ -9,7 +9,6 @@ def main():
     ap = argparse.ArgumentParser(description="Prepare ClinVar SNV dataset (compact) for contrastive training.")
     ap.add_argument("--vcf", default="clinvar.vcf", help="Path to clinvar.vcf")
     ap.add_argument("--fasta", default="hg38.fa", help="Path to hg38.fa (indexed)")
-    ap.add_argument("--gtf", default="gencode.v48.chr_patch_hapl_scaff.basic.annotation.gtf", help="Path to gencode.v48.gtf")
     ap.add_argument("--out", default="clinvar_compact.csv", help="Output CSV path")
     ap.add_argument("--window", type=int, default=1024, help="Window length (default: 1024)")
     args = ap.parse_args()

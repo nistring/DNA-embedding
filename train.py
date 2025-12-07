@@ -16,7 +16,7 @@ from dataset import (
     BalancedAlternatingDataset,
     ContrastiveDataCollator,
 )
-from model import WithProjection, ContrastiveTrainer
+from model import WrapperModel, ContrastiveTrainer
 from eval_metrics import compute_test_metrics
 
 logging.basicConfig(
@@ -116,7 +116,7 @@ def main():
     train_dataset = BalancedAlternatingDataset([refpos_dataset, refneg_dataset, mutate_dataset], training_args.per_device_train_batch_size, 42)
 
     base_model = AutoModel.from_pretrained(model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code)
-    model = WithProjection(base_model, input_dim=None, output_dim=model_args.projection_output_dim, model_type=model_args.model_type)
+    model = WrapperModel(base_model, input_dim=None, output_dim=model_args.projection_output_dim, model_type=model_args.model_type)
 
     logger.info(f"Model hidden dimension: {getattr(base_model.config, 'hidden_size', 'unknown')}")
     

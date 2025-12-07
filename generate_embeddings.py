@@ -8,7 +8,7 @@ from safetensors.torch import load_file
 from tqdm import tqdm
 import gpn.model
 
-from model import WithProjection
+from model import WrapperModel
 from eval_metrics import compute_test_metrics
 
 MODEL_NAME = "songlab/gpn-brassicales"
@@ -20,7 +20,7 @@ def load_model(checkpoint_dir: str, device: torch.device):
     print(f"Loading model from {checkpoint_dir}")
     
     base_model = AutoModel.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    model = WithProjection(base_model, input_dim=512, output_dim=2048)
+    model = WrapperModel(base_model, input_dim=512, output_dim=2048)
     
     state_dict = load_file(os.path.join(checkpoint_dir, "model.safetensors"))
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)

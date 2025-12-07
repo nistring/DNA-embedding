@@ -39,8 +39,7 @@ class ProjectionHead(torch.nn.Module):
         return self.dense(combined)
 
     
-class WithProjection(torch.nn.Module):
-    """Wrapper model with projection head and Flash Attention support."""
+class WrapperModel(torch.nn.Module):
     
     def __init__(self, base_model, input_dim=None, output_dim=2048, model_type=None, 
                  num_heads=8, num_layers=4, snv_pos=511):

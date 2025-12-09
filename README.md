@@ -90,7 +90,11 @@ python match.py
 
 ## Training
 
-Training is orchestrated by `script/train.sh` using `torchrun` with multi-GPU DDP.
+Training is orchestrated by `script/train.sh` using `torchrun` with multi-GPU DDP. The main entry point is `train.py`, which:
+- Loads and prepares three datasets: `ClinVarRefAltDataset` for benign and pathogenic SNVs, and `ContrastiveMutateDataset` for mutation severity regression
+- Uses `BalancedAlternatingDataset` for interleaved multi-task training
+- Tracks evaluation metrics via `EvaluationCallback`, which runs at epoch end and logs cosine distance (cd), pathogenic-benign distance difference (cdd), and Pearson correlation (pcc)
+- Automatically copies training configuration to output directory for reproducibility
 
 ```bash
 cd /home/work/.nistring/embedding
@@ -109,11 +113,14 @@ Evaluation is computed in `eval_metrics.py` after embeddings are generated:
 
 ## Inference Using `script/generate.sh`
 
-The `generate.sh` script provides a ready command to run embedding generation against a chosen checkpoint directory and input CSV.
+The `generate_embeddings.py` script generates embeddings using a fine-tuned model checkpoint. It supports both vanilla GPN (512D) and WrapperModel with projection head (2048D):
+
 ```bash
 cd /home/work/.nistring/embedding
-bash script/generate.sh
+python generate_embeddings.py --checkpoint <path_to_checkpoint> --input <input_csv> --output <output_csv>
 ```
+
+- `--use_vanilla_gpn`: Use vanilla GPN with mean pooling (512D) instead of projection head (2048D)
 
 ## Design: Model, Loss, and Datasets
 
@@ -135,10 +142,10 @@ The base GPN encoder is wrapped with a lightweight projection head that explicit
 These SNV-focused features (local convolution + exact SNV token) strengthen sensitivity at the mutation locus while pooled attention preserves global sequence context.
 
 ### Datasets (`dataset.py`)
-- `ClinVarRefAltDataset`: yields (ref, alt) pairs for SNVs centered at index 511 with labels `±1`. Drives contrastive discrimination between benign and pathogenic changes.
-- `ContrastiveMutateDataset`: samples random 1024bp windows from `hg38.fa` and applies `k` random point mutations (`1 ≤ k ≤ 512`). Target is `k/512` (normalized), enabling regression/ranking on mutation severity that correlates with `pcc`.
-- `BalancedAlternatingDataset`: interleaves batches from multiple datasets in a round-robin fashion for balanced multi-task training; reshuffles each epoch.
-- `ContrastiveDataCollator`: keeps pair structure by stacking two inputs per sample and flattens into a batch suitable for contrastive objectives.
+- `ClinVarRefAltDataset`: Yields (ref, alt) pairs filtered by label (±1). Contrastively encourages benign variants to match reference and pathogenic variants to diverge.
+- `ContrastiveMutateDataset`: Samples random 1024bp windows from `hg38.fa` with `k` point mutations (1 ≤ k ≤ 512). Regresses cosine distance to normalized mutation count (k/512).
+- `BalancedAlternatingDataset`: Interleaves batches from multiple datasets in round-robin fashion, reshuffling each epoch for balanced multi-task training.
+- `ContrastiveDataCollator`: Maintains pair structure (ref, alt) by stacking inputs and flattening into batches suitable for contrastive objectives.
 
 ### Loss
 - Combine a cosine-margin contrastive loss (controlled by `--cos_loss_margin`, e.g., `0.9`) for ref/alt embeddings and a regression loss on mutation level (`k/512`) from `ContrastiveMutateDataset`.

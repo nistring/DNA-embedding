@@ -35,6 +35,9 @@ def main():
         alts = rec.alts or ()
         if not rec.info.get("CLNSIG", None):
             continue
+        # Exclude records with CLNREVSTAT=no_assertion_criteria_provided
+        if "CLNREVSTAT" not in rec.info or "no_assertion_criteria_provided" in rec.info["CLNREVSTAT"]:
+            continue
         cl = rec.info["CLNSIG"][0]
         if rec.info.get("CLNVC", None) != "single_nucleotide_variant":
             continue
@@ -74,7 +77,6 @@ def main():
                 
             writer.writerow([seq, mut_idx, alt, label])
             kept += 1
-            seen += 1
         seen += 1
 
     out_f.close()

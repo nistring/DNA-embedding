@@ -14,20 +14,27 @@ def cosine_distance(emb1, emb2):
 def compute_test_metrics(embeddings_dict, test_dir="test/results"):
     """Compute evaluation metrics on test set."""
     metrics = {}
+    worst_benign_pairs = []
+    worst_pathogenic_pairs = []
 
     # ClinVar annotation using matched_pairs_labeled.csv
     clinvar_file = os.path.join(os.path.dirname(__file__), "data/matched_pairs_labeled.csv")
     if os.path.exists(clinvar_file):
         benign_distances, pathologic_distances = [], []
+        benign_records, pathologic_records = [], []
         with open(clinvar_file, "r") as f:
             for row in csv.DictReader(f):
                 a, b = row["sample_a"], row["sample_b"]
                 if a in embeddings_dict and b in embeddings_dict:
                     cd = cosine_distance(embeddings_dict[a], embeddings_dict[b])
-                    if int(row["label"]) == 1:
+                    label = int(row["label"])
+                    if label == 1:
                         benign_distances.append(cd)
-                    elif int(row["label"]) == -1:
+                        benign_records.append({"sample_a": a, "sample_b": b, "distance": cd})
+                    elif label == -1:
                         pathologic_distances.append(cd)
+                        pathologic_records.append({"sample_a": a, "sample_b": b, "distance": cd})
+        
         if benign_distances and pathologic_distances:
             mean_benign = np.mean(benign_distances)
             mean_pathologic = np.mean(pathologic_distances)
@@ -35,6 +42,10 @@ def compute_test_metrics(embeddings_dict, test_dir="test/results"):
                 "cdd": mean_pathologic - mean_benign,
                 "cd": np.mean(benign_distances + pathologic_distances)
             })
+            
+            # Get top 10 worst for each category
+            worst_benign_pairs = sorted(benign_records, key=lambda x: x["distance"], reverse=True)[:10]
+            worst_pathogenic_pairs = sorted(pathologic_records, key=lambda x: x["distance"])[:10]
 
     # Mutation annotation
     mut_file = os.path.join(test_dir, "match_mut.csv")
@@ -48,9 +59,9 @@ def compute_test_metrics(embeddings_dict, test_dir="test/results"):
                     mut_counts.append(int(row["distance"]))
         
         if len(distances_list) > 1:
-            pcc, pvalue = pearsonr(np.array(distances_list), np.array(mut_counts)) #np.log2(np.array(mut_counts)) / 9.0)
+            pcc, pvalue = pearsonr(np.array(distances_list), np.array(mut_counts))
             metrics.update({"pcc": pcc})
 
     metrics.update({"mean": (metrics["cd"] + metrics["cdd"] + metrics["pcc"])/3} )
     
-    return metrics
+    return metrics, worst_benign_pairs, worst_pathogenic_pairs

@@ -40,15 +40,14 @@ class ClinVarRefAltDataset(Dataset):
 
 
 class ContrastiveMutateDataset(Dataset):
-    """Contrastive mutation dataset with log2(mutation count) as target."""
+    """Contrastive mutation dataset with mutation count as target."""
     DNA = ["A", "C", "G", "T"]
 
     def __init__(self, path: str, tokenizer: transformers.PreTrainedTokenizer, seq_length: int = 1024,
-                 mut_levels=(1, 2, 8, 64, 128, 256, 512), seed: int = 42, num_samples: int = None):
+                 seed: int = 42, num_samples: int = None):
         super().__init__()
         self.fasta_path = path
         self.seq_length = seq_length
-        self.mut_levels = tuple(mut_levels)
         self.tokenizer = tokenizer
         self.rng = random.Random(seed)
         self.num_samples = num_samples

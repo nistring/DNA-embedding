@@ -16,7 +16,7 @@ NUM_GPUS=2
 MODEL_NAME="songlab/gpn-brassicales"
 TOKENIZER_NAME="gonzalobenegas/tokenizer-dna-mlm"
 DATA_PATH="./data"  # Update with your data directory
-RUN_NAME="0.9_abs"
+RUN_NAME="0.8"
 OUTPUT_DIR="./output/${RUN_NAME}"
 
 # Training hyperparameters
@@ -69,9 +69,5 @@ torchrun --nproc_per_node=${NUM_GPUS} train.py \
     --dataloader_pin_memory True \
     --remove_unused_columns False \
     --bf16 --bf16_full_eval \
-    --cos_loss_margin 0.9 \
+    --cos_loss_margin 0.8 \
     > "${OUTPUT_DIR}/training.log" 2>&1 &
-# --fp16 \
-
-#--soft_masked_loss_weight_train 0.1 --soft_masked_loss_weight_evaluation 0.0 \
-echo "Training complete! Model saved to ${OUTPUT_DIR}/joint"

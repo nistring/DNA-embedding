@@ -36,6 +36,7 @@ class ProjectionHead(torch.nn.Module):
         aggregated = self.layer_norm_mha(self.mha(max_pooled, max_pooled, max_pooled)[0])
 
         combined = torch.cat([aggregated.mean(dim=1), aggregated.max(dim=1)[0], snv_feat, local_feat], dim=-1)
+        #combined = torch.cat([aggregated.mean(dim=1), aggregated.max(dim=1)[0]], dim=-1) # for ablation studies
         return self.dense(combined)
 
     
@@ -108,9 +109,7 @@ class ContrastiveTrainer(transformers.Trainer):
         embeddings = embeddings[0].view(labels.shape[0], 2, -1)
 
         if batch_type == 0:
-            loss = torch.cosine_similarity(embeddings[:, 0], embeddings[:, 1], dim=-1)
-            loss = (loss[labels == -1].sum() + (loss[labels == 1] - self.margin).abs().sum()) / labels.shape[0]
-            # loss = self.cos_loss(embeddings[:, 0], -embeddings[:, 1], -labels)
+            loss = self.cos_loss(embeddings[:, 0], -embeddings[:, 1], -labels)
             if should_log:
                 logger.info(f"cos_loss: {loss.item():.4f}")
             return loss

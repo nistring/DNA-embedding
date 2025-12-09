@@ -209,7 +209,9 @@ __marimo__/
 data/*
 !data/*.py
 mlruns/
-output/
+output/*
 wandb
 nohup.out
 !data/test.csv
+!data/matched_pairs_labeled.csv
+!output/model.safetensors

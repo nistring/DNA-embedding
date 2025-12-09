@@ -9,7 +9,7 @@ The pipeline:
 - Train a GPN-based model with contrastive objectives using distributed `torchrun`.
 
 ## Setup
-- OS: Linux; Shell: `bash`.
+- OS: Ubuntu 24.04.
 - Model backend: Hugging Face Transformers + PyTorch.
 
 ### Create Conda Environment
@@ -21,15 +21,16 @@ conda activate dna-embed
 ### Install Dependencies
 Install packages used in this repo:
 ```bash
+cd DNA-embedding
 pip install -r requirements.txt
+pip install git+https://github.com/songlab-cal/gpn.git
 ```
 
 ## Dataset Construction
 
 ### 1) Download References
-Download hg38 reference FASTA (indexed later) and ClinVar VCF (GRCh38):
+Download hg38 reference FASTA and ClinVar VCF (GRCh38):
 ```bash
-mkdir -p data
 cd data
 wget https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz
 wget https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz
@@ -37,16 +38,10 @@ gunzip -k hg38.fa.gz
 gunzip -k clinvar.vcf.gz
 ```
 
-Index the FASTA for fast region fetches:
-```bash
-samtools faidx hg38.fa
-```
-
 ### 2) Generate Compact ClinVar CSV
 `prepare_clinvar_dataset.py` extracts 1024bp windows centered on SNVs, placing the reference base at index 511 (0-based) and records the alternate base and label. Only Benign and Pathogenic (including Likely Pathogenic) entries are kept.
 
 ```bash
-cd /home/work/.nistring/embedding/data
 python prepare_clinvar_dataset.py --vcf clinvar.vcf --fasta hg38.fa --out clinvar_compact.csv --window 1024
 ```
 
@@ -62,7 +57,6 @@ Outputs:
 
 Run it after placing `test.csv` and `clinvar_compact.csv` in `data/` and precomputing matches into `test/results/match_clinvar.csv`:
 ```bash
-cd /home/work/.nistring/embedding/data
 python sequence_matcher.py
 ```
 
@@ -70,7 +64,7 @@ Outputs:
 - `clinvar_compact_removed.csv`: filtered ClinVar without matched leakage entries.
 - `matched_pairs_labeled.csv`: pairs from `test.csv` with labels inferred via ClinVar mapping on the SNV position.
 
-## Hamming Distance Pair Computation
+## Hamming Distance Pair Computation (Optional)
 
 `test/match.py` computes Hamming distances among all unordered pairs in `data/test.csv` and emits two CSVs:
 - `match_clinvar.csv`: pairs at distance 1 with a differing base at position 512 (1-based), used to infer ClinVar labels.
@@ -78,13 +72,12 @@ Outputs:
 
 It uses a compiled `_hdist` module for speed. To build and run on your machine:
 ```bash
-cd /home/work/.nistring/embedding/test
+cd ~/DNA-embedding/test
 python setup.py build_ext --inplace
 ```
 
 ### Run Pair Matching
 ```bash
-cd /home/work/.nistring/embedding/test
 python match.py
 ```
 
@@ -97,7 +90,7 @@ Training is orchestrated by `script/train.sh` using `torchrun` with multi-GPU DD
 - Automatically copies training configuration to output directory for reproducibility
 
 ```bash
-cd /home/work/.nistring/embedding
+cd ~/DNA-embedding
 bash script/train.sh
 ```
 
@@ -116,9 +109,13 @@ Evaluation is computed in `eval_metrics.py` after embeddings are generated:
 The `generate_embeddings.py` script generates embeddings using a fine-tuned model checkpoint. It supports both vanilla GPN (512D) and WrapperModel with projection head (2048D):
 
 ```bash
-cd /home/work/.nistring/embedding
 python generate_embeddings.py --checkpoint <path_to_checkpoint> --input <input_csv> --output <output_csv>
 ```
+or
+```bash
+bash script/generate.sh
+```
+This runs the model loaded with `output/model.safetensors` by default.
 
 - `--use_vanilla_gpn`: Use vanilla GPN with mean pooling (512D) instead of projection head (2048D)
 

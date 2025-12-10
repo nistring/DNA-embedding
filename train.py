@@ -88,7 +88,7 @@ class EvaluationCallback(TrainerCallback):
                 for j, sid in enumerate(batch_ids):
                     embeddings[sid] = projected[j].cpu().numpy()
         
-        metrics = compute_test_metrics(embeddings, self.test_dir)
+        metrics = compute_test_metrics(embeddings, self.test_dir)[0]
         for key, value in metrics.items():
             logger.info(f"eval_{key}: {value:.4f}")
 
